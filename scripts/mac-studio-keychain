@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+IFS=$'\n\t'
+umask 077
+
+ACTION="${1:-check}"
+if [[ $# -gt 0 ]]; then shift; fi
+ACCOUNT="$(id -un)"
+SERVICE="coinpilot-slack-webhook"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --account)
+      [[ $# -ge 2 ]] || { echo "error: --account requires a value" >&2; exit 64; }
+      ACCOUNT="$2"
+      shift
+      ;;
+    --service)
+      [[ $# -ge 2 ]] || { echo "error: --service requires a value" >&2; exit 64; }
+      SERVICE="$2"
+      shift
+      ;;
+    *)
+      echo "error: unknown option: $1" >&2
+      exit 64
+      ;;
+  esac
+  shift
+done
+
+command -v security >/dev/null 2>&1 || {
+  echo "error: macOS security command is required" >&2
+  exit 1
+}
+
+case "${ACTION}" in
+  set)
+    if [[ ! -t 0 ]]; then
+      echo "error: Keychain password prompt requires an interactive terminal" >&2
+      exit 1
+    fi
+    printf '%s\n' \
+      'Enter the Slack Incoming Webhook at the macOS Keychain password prompt.' \
+      'Input is hidden and is never passed in argv, environment, or a file.' >&2
+    # Apple documents that a final -w with no argument prompts securely. Passing
+    # a value after -w would expose the secret through the process argv.
+    security add-generic-password \
+      -U -a "${ACCOUNT}" -s "${SERVICE}" -w >/dev/null
+    WEBHOOK="$(
+      security find-generic-password \
+        -a "${ACCOUNT}" -s "${SERVICE}" -w
+    )"
+    if [[ ! "${WEBHOOK}" =~ ^https://hooks\.slack\.com/services/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$ ]]; then
+      security delete-generic-password \
+        -a "${ACCOUNT}" -s "${SERVICE}" >/dev/null 2>&1 || true
+      unset WEBHOOK
+      echo "error: invalid Slack webhook; the new Keychain item was deleted" >&2
+      exit 1
+    fi
+    unset WEBHOOK
+    echo "Slack webhook saved in Keychain (service=${SERVICE}, account=${ACCOUNT})."
+    ;;
+  check)
+    if security find-generic-password -a "${ACCOUNT}" -s "${SERVICE}" >/dev/null 2>&1; then
+      echo "Slack webhook exists in Keychain (value not displayed)."
+    else
+      echo "Slack webhook is not configured in Keychain." >&2
+      exit 1
+    fi
+    ;;
+  delete)
+    if security find-generic-password -a "${ACCOUNT}" -s "${SERVICE}" >/dev/null 2>&1; then
+      security delete-generic-password -a "${ACCOUNT}" -s "${SERVICE}" >/dev/null
+      echo "Slack webhook deleted from Keychain."
+    else
+      echo "Slack webhook was already absent."
+    fi
+    ;;
+  *)
+    echo "usage: mac-studio-keychain {set|check|delete} [--account USER] [--service NAME]" >&2
+    exit 64
+    ;;
+esac

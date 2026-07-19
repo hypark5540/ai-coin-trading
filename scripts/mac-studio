@@ -1,0 +1,958 @@
+#!/usr/bin/env bash
+#
+# Idempotent, user-scoped Mac Studio installer for Coinpilot shadow trading.
+# Mutating commands are dry-run by default and require --apply.
+
+set -euo pipefail
+IFS=$'\n\t'
+umask 077
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+
+DEFAULT_APP_HOME="${HOME}/Library/Application Support/Coinpilot"
+APP_HOME="${COINPILOT_HOME:-${DEFAULT_APP_HOME}}"
+APPLY=0
+FOLLOW=0
+START_SERVICES=1
+COMMAND="${1:-help}"
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+POSITIONAL=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply)
+      APPLY=1
+      ;;
+    --dry-run)
+      APPLY=0
+      ;;
+    --home)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --home requires a path" >&2
+        exit 64
+      fi
+      APP_HOME="$2"
+      shift
+      ;;
+    --follow|-f)
+      FOLLOW=1
+      ;;
+    --no-start)
+      START_SERVICES=0
+      ;;
+    --help|-h)
+      COMMAND="help"
+      ;;
+    --)
+      shift
+      while [[ $# -gt 0 ]]; do
+        POSITIONAL[${#POSITIONAL[@]}]="$1"
+        shift
+      done
+      break
+      ;;
+    -*)
+      echo "error: unknown option: $1" >&2
+      exit 64
+      ;;
+    *)
+      POSITIONAL[${#POSITIONAL[@]}]="$1"
+      ;;
+  esac
+  shift
+done
+
+CONFIG_DIR="${APP_HOME}/config"
+DATA_DIR="${APP_HOME}/data"
+RAW_DIR="${DATA_DIR}/raw"
+STATE_DIR="${APP_HOME}/state"
+LOG_DIR="${HOME}/Library/Logs/Coinpilot"
+BACKUP_DIR="${APP_HOME}/backups"
+BIN_DIR="${APP_HOME}/bin"
+VENV_DIR="${APP_HOME}/venv"
+RENDERED_LAUNCHD_DIR="${APP_HOME}/launchd"
+LAUNCH_AGENTS_DIR="${HOME}/Library/LaunchAgents"
+CONFIG_PATH="${CONFIG_DIR}/config.toml"
+RUNTIME_ENV="${CONFIG_DIR}/runtime.env"
+PAPER_DB_PATH="${DATA_DIR}/coinpilot.db"
+SHADOW_DB_PATH="${DATA_DIR}/shadow.db"
+BUILD_LOCK_FILE="${REPO_ROOT}/requirements-build.lock"
+RUNTIME_LOCK_FILE="${REPO_ROOT}/requirements.lock"
+KEYCHAIN_SERVICE="${COINPILOT_SLACK_KEYCHAIN_SERVICE:-coinpilot-slack-webhook}"
+KEYCHAIN_ACCOUNT="${COINPILOT_KEYCHAIN_ACCOUNT:-coinpilot-shadow}"
+MANAGED_SENTINEL=".coinpilot-managed"
+
+LABEL_PREFIX="dev.coinpilot"
+SERVICES=(shadow notifier web external-watchdog backup retention)
+PYTHON_BIN=""
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./scripts/mac-studio <command> [options]
+
+Commands:
+  bootstrap       Full first-time setup; may install Python with existing Homebrew
+  install         Install/update the venv, config, helpers, plists, and services
+  update          git pull --ff-only, reinstall, and restart services
+  uninstall       Unload services and remove installed launchd/helper files only
+  doctor          Read-only configuration and health checks
+  status          Show launchd and localhost health
+  start [service] Load and start one service or all configured services
+  stop [service]  Unload one service or all services
+  restart [svc]   Reload one service or all services
+  logs [service]  Show the last 100 log lines; add --follow to follow
+  slack set       Prompt for a Slack webhook and save it in macOS Keychain
+  slack check     Check whether the Keychain item exists without revealing it
+  slack delete    Delete the Keychain item
+  backup          Create and verify a SQLite online backup
+  retention       Rotate logs and prune files older than configured limits
+  test            Run shell/static operations tests
+
+Options:
+  --apply         Perform changes. Mutating commands are dry-run without this.
+  --dry-run       Explicitly preview changes (the default).
+  --home PATH     Override the application home.
+  --follow, -f    Follow logs.
+  --no-start      Install/render without loading any service.
+
+Examples:
+  ./scripts/mac-studio slack set --apply
+  ./scripts/mac-studio bootstrap --apply
+  ./scripts/mac-studio doctor
+  ./scripts/mac-studio logs shadow --follow
+
+No command installs a system LaunchDaemon, invokes sudo, enables live trading, or
+deletes application data. The user must have an active login session so the
+LaunchAgents and Keychain item are available.
+EOF
+}
+
+quote_cmd() {
+  local arg
+  printf '[dry-run]'
+  for arg in "$@"; do
+    printf ' %q' "$arg"
+  done
+  printf '\n'
+}
+
+run_cmd() {
+  if [[ "${APPLY}" -eq 1 ]]; then
+    "$@"
+  else
+    quote_cmd "$@"
+  fi
+}
+
+note() {
+  printf '==> %s\n' "$*"
+}
+
+warn() {
+  printf 'warning: %s\n' "$*" >&2
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+is_macos() {
+  [[ "$(uname -s)" == "Darwin" ]]
+}
+
+require_macos_for_apply() {
+  if [[ "${APPLY}" -eq 1 ]] && ! is_macos; then
+    die "apply mode is supported only on macOS"
+  fi
+}
+
+select_python() {
+  local candidate
+  if [[ -n "${COINPILOT_PYTHON:-}" ]]; then
+    candidate="${COINPILOT_PYTHON}"
+    if [[ -x "${candidate}" ]]; then
+      PYTHON_BIN="${candidate}"
+      return 0
+    fi
+    return 1
+  fi
+
+  for candidate in \
+    "$(command -v python3 2>/dev/null || true)" \
+    "/opt/homebrew/bin/python3" \
+    "/usr/local/bin/python3"; do
+    if [[ -n "${candidate}" && -x "${candidate}" ]]; then
+      if "${candidate}" -c 'import sys; raise SystemExit(sys.version_info < (3, 11))' 2>/dev/null; then
+        PYTHON_BIN="${candidate}"
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+ensure_python() {
+  local allow_brew="${1:-0}"
+  if select_python; then
+    note "Python: ${PYTHON_BIN} ($("${PYTHON_BIN}" --version 2>&1))"
+    return 0
+  fi
+
+  if [[ "${allow_brew}" -eq 1 ]] && command -v brew >/dev/null 2>&1; then
+    note "Python >= 3.11 is missing; existing Homebrew can install python@3.12"
+    run_cmd brew install python@3.12
+    if [[ "${APPLY}" -eq 0 ]]; then
+      PYTHON_BIN="$(brew --prefix)/bin/python3"
+      return 0
+    fi
+    select_python || die "Homebrew completed but Python >= 3.11 was not found"
+    return 0
+  fi
+
+  die "Python >= 3.11 is required. Install it first, or install Homebrew and rerun bootstrap."
+}
+
+runtime_value() {
+  local key="$1"
+  local fallback="$2"
+  local value=""
+  if [[ -f "${RUNTIME_ENV}" ]]; then
+    value="$(awk -F= -v wanted="${key}" '
+      $0 !~ /^[[:space:]]*#/ && $1 == wanted {
+        sub(/^[^=]*=/, "")
+        print
+        exit
+      }
+    ' "${RUNTIME_ENV}")"
+  fi
+  if [[ -n "${value}" ]]; then
+    printf '%s' "${value}"
+  else
+    printf '%s' "${fallback}"
+  fi
+}
+
+is_true() {
+  case "$1" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+create_layout() {
+  local managed_dir
+  note "Creating owner-only application directories"
+  run_cmd mkdir -p \
+    "${CONFIG_DIR}" "${DATA_DIR}" "${RAW_DIR}" "${STATE_DIR}" \
+    "${LOG_DIR}" "${BACKUP_DIR}" "${BIN_DIR}" "${RENDERED_LAUNCHD_DIR}" \
+    "${LAUNCH_AGENTS_DIR}"
+  if [[ "${APPLY}" -eq 1 ]]; then
+    chmod 700 \
+      "${APP_HOME}" "${CONFIG_DIR}" "${DATA_DIR}" "${RAW_DIR}" "${STATE_DIR}" \
+      "${LOG_DIR}" "${BACKUP_DIR}" "${BIN_DIR}" "${RENDERED_LAUNCHD_DIR}"
+    for managed_dir in "${RAW_DIR}" "${BACKUP_DIR}" "${LOG_DIR}"; do
+      printf 'coinpilot-managed-v1\n' > "${managed_dir}/${MANAGED_SENTINEL}"
+      chmod 600 "${managed_dir}/${MANAGED_SENTINEL}"
+    done
+  else
+    quote_cmd chmod 700 "${APP_HOME}" "${CONFIG_DIR}" "${DATA_DIR}" "${RAW_DIR}" \
+      "${STATE_DIR}" "${LOG_DIR}" "${BACKUP_DIR}" "${BIN_DIR}" \
+      "${RENDERED_LAUNCHD_DIR}"
+    for managed_dir in "${RAW_DIR}" "${BACKUP_DIR}" "${LOG_DIR}"; do
+      quote_cmd install -m 0600 /dev/null "${managed_dir}/${MANAGED_SENTINEL}"
+    done
+  fi
+}
+
+generate_config() {
+  local example="${REPO_ROOT}/config.example.toml"
+  [[ -f "${example}" ]] || die "missing ${example}"
+
+  if [[ -f "${CONFIG_PATH}" ]]; then
+    note "Preserving existing config: ${CONFIG_PATH}"
+  elif [[ "${APPLY}" -eq 0 ]]; then
+    quote_cmd "${PYTHON_BIN}" "-c" "generate config without secrets" "${example}" "${CONFIG_PATH}"
+  else
+    note "Generating config without secrets: ${CONFIG_PATH}"
+    "${PYTHON_BIN}" - "${example}" "${CONFIG_PATH}" \
+      "${PAPER_DB_PATH}" "${SHADOW_DB_PATH}" "${RAW_DIR}" "${BACKUP_DIR}" \
+      "${KEYCHAIN_SERVICE}" "${KEYCHAIN_ACCOUNT}" <<'PY'
+import os
+import pathlib
+import sys
+
+source = pathlib.Path(sys.argv[1])
+destination = pathlib.Path(sys.argv[2])
+paper_database = sys.argv[3]
+shadow_database = sys.argv[4]
+archive_root = sys.argv[5]
+backup_dir = sys.argv[6]
+keychain_service = sys.argv[7]
+keychain_account = sys.argv[8]
+
+def toml_string(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+replacements = {
+    ("data", "database_path"): paper_database,
+    ("shadow", "database_path"): shadow_database,
+    ("shadow", "archive_root"): archive_root,
+    ("operations", "backup_dir"): backup_dir,
+    ("operations", "keychain_service"): keychain_service,
+    ("operations", "keychain_account"): keychain_account,
+}
+found = set()
+section = ""
+output = []
+for line in source.read_text(encoding="utf-8").splitlines():
+    stripped = line.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        section = stripped[1:-1]
+    elif "=" in line and not stripped.startswith("#"):
+        key = line.split("=", 1)[0].strip()
+        pair = (section, key)
+        if pair in replacements:
+            line = f"{key} = {toml_string(replacements[pair])}"
+            found.add(pair)
+    output.append(line)
+missing = sorted(set(replacements) - found)
+if missing:
+    raise SystemExit(f"expected config setting(s) not found in {source}: {missing}")
+text = "\n".join(output) + "\n"
+temporary = destination.with_name(destination.name + ".tmp")
+temporary.write_text(text, encoding="utf-8")
+os.chmod(temporary, 0o600)
+os.replace(temporary, destination)
+PY
+  fi
+
+  if [[ -f "${RUNTIME_ENV}" ]]; then
+    note "Preserving existing runtime settings: ${RUNTIME_ENV}"
+  elif [[ "${APPLY}" -eq 0 ]]; then
+    quote_cmd "${PYTHON_BIN}" "-c" "generate runtime.env without secrets" "${RUNTIME_ENV}"
+  else
+    note "Generating runtime settings without secrets: ${RUNTIME_ENV}"
+    "${PYTHON_BIN}" - "${RUNTIME_ENV}" <<'PY'
+import os
+import pathlib
+import sys
+
+destination = pathlib.Path(sys.argv[1])
+values = {
+    "COINPILOT_WEB_HOST": "127.0.0.1",
+    "COINPILOT_WEB_PORT": "8765",
+    "COINPILOT_ENABLE_SHADOW": "1",
+    "COINPILOT_ENABLE_NOTIFIER": "1",
+    "COINPILOT_ENABLE_WEB": "1",
+    "COINPILOT_ENABLE_WATCHDOG": "1",
+    "COINPILOT_RETENTION_DAYS": "90",
+    "COINPILOT_BACKUP_RETENTION_DAYS": "35",
+    "COINPILOT_LOG_RETENTION_DAYS": "30",
+    "COINPILOT_LOG_MAX_MB": "100",
+}
+text = "\n".join(
+    [
+        "# Generated by scripts/mac-studio. This file never contains secrets.",
+        "# Stop services before changing strategy or risk configuration.",
+        *(f"{key}={value}" for key, value in values.items()),
+        "",
+    ]
+)
+temporary = destination.with_name(destination.name + ".tmp")
+temporary.write_text(text, encoding="utf-8")
+os.chmod(temporary, 0o600)
+os.replace(temporary, destination)
+PY
+  fi
+}
+
+install_runtime() {
+  [[ -f "${BUILD_LOCK_FILE}" ]] || die "missing build lock: ${BUILD_LOCK_FILE}"
+  [[ -f "${RUNTIME_LOCK_FILE}" ]] || die "missing runtime lock: ${RUNTIME_LOCK_FILE}"
+  note "Creating/updating isolated Python environment"
+  run_cmd "${PYTHON_BIN}" -m venv "${VENV_DIR}"
+  run_cmd "${VENV_DIR}/bin/python" -m pip install \
+    --disable-pip-version-check --requirement "${BUILD_LOCK_FILE}"
+  run_cmd "${VENV_DIR}/bin/python" -m pip install \
+    --disable-pip-version-check --requirement "${RUNTIME_LOCK_FILE}"
+  run_cmd "${VENV_DIR}/bin/python" -m pip install \
+    --disable-pip-version-check --no-deps --no-build-isolation --editable "${REPO_ROOT}"
+}
+
+install_helpers() {
+  note "Installing stable service helpers"
+  run_cmd install -m 0755 "${REPO_ROOT}/scripts/coinpilot-service.sh" \
+    "${BIN_DIR}/coinpilot-service"
+  run_cmd install -m 0755 "${REPO_ROOT}/scripts/mac-studio-backup" \
+    "${BIN_DIR}/coinpilot-backup"
+  run_cmd install -m 0755 "${REPO_ROOT}/scripts/mac-studio-retention" \
+    "${BIN_DIR}/coinpilot-retention"
+  run_cmd install -m 0755 "${REPO_ROOT}/scripts/mac-studio-keychain" \
+    "${BIN_DIR}/coinpilot-keychain"
+  if [[ "${APPLY}" -eq 1 ]]; then
+    printf '%s\n' "${REPO_ROOT}" > "${STATE_DIR}/repo-root"
+    chmod 600 "${STATE_DIR}/repo-root"
+  else
+    quote_cmd printf '%s' "${REPO_ROOT}" ">" "${STATE_DIR}/repo-root"
+  fi
+}
+
+render_plist() {
+  local service="$1"
+  local template="${REPO_ROOT}/ops/launchd/${LABEL_PREFIX}.${service}.plist.in"
+  local rendered="${RENDERED_LAUNCHD_DIR}/${LABEL_PREFIX}.${service}.plist"
+  local installed="${LAUNCH_AGENTS_DIR}/${LABEL_PREFIX}.${service}.plist"
+  [[ -f "${template}" ]] || die "missing launchd template: ${template}"
+
+  if [[ "${APPLY}" -eq 0 ]]; then
+    quote_cmd "${PYTHON_BIN}" "-c" "render launchd plist" "${template}" "${installed}"
+    return 0
+  fi
+
+  "${PYTHON_BIN}" - "${template}" "${rendered}" \
+    "LABEL=${LABEL_PREFIX}.${service}" \
+    "APP_HOME=${APP_HOME}" \
+    "REPO_ROOT=${REPO_ROOT}" \
+    "CONFIG_PATH=${CONFIG_PATH}" \
+    "RUNTIME_ENV=${RUNTIME_ENV}" \
+    "LOG_DIR=${LOG_DIR}" \
+    "SERVICE_EXECUTABLE=${BIN_DIR}/coinpilot-service" \
+    "BACKUP_EXECUTABLE=${BIN_DIR}/coinpilot-backup" \
+    "RETENTION_EXECUTABLE=${BIN_DIR}/coinpilot-retention" \
+    "KEYCHAIN_SERVICE=${KEYCHAIN_SERVICE}" \
+    "KEYCHAIN_ACCOUNT=${KEYCHAIN_ACCOUNT}" <<'PY'
+import html
+import os
+import pathlib
+import plistlib
+import sys
+
+template = pathlib.Path(sys.argv[1])
+destination = pathlib.Path(sys.argv[2])
+replacements = {}
+for item in sys.argv[3:]:
+    key, value = item.split("=", 1)
+    replacements[key] = html.escape(value, quote=True)
+
+text = template.read_text(encoding="utf-8")
+for key, value in replacements.items():
+    text = text.replace(f"@@{key}@@", value)
+if "@@" in text:
+    raise SystemExit(f"unresolved placeholder in {template}")
+plistlib.loads(text.encode("utf-8"))
+temporary = destination.with_name(destination.name + ".tmp")
+temporary.write_text(text, encoding="utf-8")
+os.chmod(temporary, 0o600)
+os.replace(temporary, destination)
+PY
+  install -m 0644 "${rendered}" "${installed}"
+}
+
+render_all_plists() {
+  local service
+  note "Rendering user-scoped launchd jobs"
+  for service in "${SERVICES[@]}"; do
+    render_plist "${service}"
+  done
+}
+
+launch_domain() {
+  local uid
+  uid="$(id -u)"
+  if launchctl print "gui/${uid}" >/dev/null 2>&1; then
+    printf 'gui/%s' "${uid}"
+  elif launchctl print "user/${uid}" >/dev/null 2>&1; then
+    printf 'user/%s' "${uid}"
+  else
+    return 1
+  fi
+}
+
+plist_path() {
+  printf '%s/%s.%s.plist' "${LAUNCH_AGENTS_DIR}" "${LABEL_PREFIX}" "$1"
+}
+
+service_label() {
+  printf '%s.%s' "${LABEL_PREFIX}" "$1"
+}
+
+service_is_loaded() {
+  local service="$1"
+  local domain
+  domain="$(launch_domain 2>/dev/null || true)"
+  [[ -n "${domain}" ]] || return 1
+  launchctl print "${domain}/$(service_label "${service}")" >/dev/null 2>&1
+}
+
+bootout_service() {
+  local service="$1"
+  local domain
+  domain="$(launch_domain 2>/dev/null || true)"
+  if [[ -z "${domain}" ]]; then
+    if [[ "${APPLY}" -eq 1 ]]; then
+      warn "no launchd user domain is active; ${service} was not unloaded"
+    else
+      quote_cmd launchctl bootout "gui/$(id -u)/$(service_label "${service}")"
+    fi
+    return 0
+  fi
+  if [[ "${APPLY}" -eq 0 ]]; then
+    quote_cmd launchctl bootout "${domain}/$(service_label "${service}")"
+  elif service_is_loaded "${service}"; then
+    launchctl bootout "${domain}/$(service_label "${service}")"
+  fi
+}
+
+bootstrap_service() {
+  local service="$1"
+  local kick="${2:-0}"
+  local domain
+  local plist
+  domain="$(launch_domain 2>/dev/null || true)"
+  plist="$(plist_path "${service}")"
+  if [[ "${APPLY}" -eq 0 ]]; then
+    quote_cmd launchctl bootstrap "gui/$(id -u)" "${plist}"
+    if [[ "${kick}" -eq 1 ]]; then
+      quote_cmd launchctl kickstart -k "gui/$(id -u)/$(service_label "${service}")"
+    fi
+    return 0
+  fi
+  [[ -n "${domain}" ]] || die "no launchd user domain; log in as $(id -un) and rerun"
+  [[ -f "${plist}" ]] || die "missing installed plist: ${plist}"
+  bootout_service "${service}"
+  launchctl enable "${domain}/$(service_label "${service}")" >/dev/null 2>&1 || true
+  launchctl bootstrap "${domain}" "${plist}"
+  if [[ "${kick}" -eq 1 ]]; then
+    launchctl kickstart -k "${domain}/$(service_label "${service}")"
+  fi
+}
+
+keychain_has_slack() {
+  command -v security >/dev/null 2>&1 || return 1
+  security find-generic-password \
+    -a "${KEYCHAIN_ACCOUNT}" -s "${KEYCHAIN_SERVICE}" >/dev/null 2>&1
+}
+
+cli_has_shadow_commands() {
+  local help
+  [[ -x "${VENV_DIR}/bin/coinpilot" ]] || return 1
+  help="$("${VENV_DIR}/bin/coinpilot" --help 2>&1 || true)"
+  printf '%s' "${help}" | grep -q 'shadow-run' &&
+    printf '%s' "${help}" | grep -q 'shadow-notify' &&
+    printf '%s' "${help}" | grep -q 'shadow-web' &&
+    printf '%s' "${help}" | grep -q 'shadow-watchdog'
+}
+
+service_enabled() {
+  local service="$1"
+  local setting
+  case "${service}" in
+    shadow) setting="$(runtime_value COINPILOT_ENABLE_SHADOW 1)" ;;
+    notifier) setting="$(runtime_value COINPILOT_ENABLE_NOTIFIER 1)" ;;
+    web) setting="$(runtime_value COINPILOT_ENABLE_WEB 1)" ;;
+    external-watchdog) setting="$(runtime_value COINPILOT_ENABLE_WATCHDOG 1)" ;;
+    backup|retention) setting="1" ;;
+    *) return 1 ;;
+  esac
+  is_true "${setting}"
+}
+
+load_configured_services() {
+  local service
+  if [[ "${APPLY}" -eq 1 ]] && ! cli_has_shadow_commands; then
+    warn "shadow CLI commands are not installed; plists were installed but services were not started"
+    warn "run ./scripts/mac-studio update --apply after installing the shadow runtime"
+    return 0
+  fi
+
+  for service in shadow web external-watchdog backup retention; do
+    if service_enabled "${service}"; then
+      case "${service}" in
+        shadow|web) bootstrap_service "${service}" 1 ;;
+        *) bootstrap_service "${service}" 0 ;;
+      esac
+    fi
+  done
+
+  if service_enabled notifier; then
+    if keychain_has_slack || [[ "${APPLY}" -eq 0 ]]; then
+      bootstrap_service notifier 1
+    else
+      warn "Slack Keychain item is missing; notifier was installed but not started"
+      warn "run ./scripts/mac-studio slack set --apply, then restart --apply"
+    fi
+  fi
+}
+
+install_all() {
+  local allow_brew="${1:-0}"
+  require_macos_for_apply
+  [[ -f "${REPO_ROOT}/pyproject.toml" ]] || die "run this command from the cloned repository"
+  ensure_python "${allow_brew}"
+  create_layout
+  generate_config
+  install_runtime
+  install_helpers
+  render_all_plists
+  if [[ "${START_SERVICES}" -eq 1 ]]; then
+    load_configured_services
+  else
+    note "Services were not loaded because --no-start was selected"
+  fi
+  if [[ "${APPLY}" -eq 1 ]]; then
+    note "Installation completed. Data and configuration were preserved."
+  else
+    note "Dry-run only. Rerun with --apply to perform these changes."
+  fi
+}
+
+git_update() {
+  command -v git >/dev/null 2>&1 || die "git is required"
+  [[ -d "${REPO_ROOT}/.git" ]] || die "${REPO_ROOT} is not a git checkout"
+  if [[ "${APPLY}" -eq 0 ]]; then
+    quote_cmd git -C "${REPO_ROOT}" status --short
+    quote_cmd git -C "${REPO_ROOT}" pull --ff-only
+    return 0
+  fi
+  if [[ -n "$(git -C "${REPO_ROOT}" status --porcelain)" ]]; then
+    die "working tree is not clean; commit or stash local changes before update"
+  fi
+  git -C "${REPO_ROOT}" pull --ff-only
+}
+
+uninstall_services() {
+  local service
+  require_macos_for_apply
+  note "Unloading known Coinpilot LaunchAgents"
+  for service in "${SERVICES[@]}"; do
+    bootout_service "${service}"
+  done
+
+  note "Removing only installed helpers and LaunchAgent definitions"
+  for service in "${SERVICES[@]}"; do
+    run_cmd rm -f "$(plist_path "${service}")"
+  done
+  run_cmd rm -f \
+    "${BIN_DIR}/coinpilot-service" \
+    "${BIN_DIR}/coinpilot-backup" \
+    "${BIN_DIR}/coinpilot-retention" \
+    "${BIN_DIR}/coinpilot-keychain"
+
+  warn "Preserved: ${CONFIG_DIR}, ${DATA_DIR}, ${BACKUP_DIR}, ${LOG_DIR}, ${VENV_DIR}"
+  if [[ "${APPLY}" -eq 0 ]]; then
+    note "Dry-run only. Rerun with --apply to uninstall."
+  fi
+}
+
+validate_service_name() {
+  case "$1" in
+    all|shadow|notifier|web|external-watchdog|backup|retention) return 0 ;;
+    *) die "unknown service '$1'; expected all, ${SERVICES[*]}" ;;
+  esac
+}
+
+for_each_service() {
+  local action="$1"
+  local requested="$2"
+  local service
+  validate_service_name "${requested}"
+  if [[ "${requested}" == "all" ]]; then
+    for service in "${SERVICES[@]}"; do
+      "${action}" "${service}"
+    done
+  else
+    "${action}" "${requested}"
+  fi
+}
+
+start_one() {
+  local service="$1"
+  local kick=0
+  if ! service_enabled "${service}"; then
+    note "Skipping disabled service: ${service}"
+    return 0
+  fi
+  case "${service}" in
+    notifier)
+      if [[ "${APPLY}" -eq 1 ]] && ! keychain_has_slack; then
+        warn "Slack Keychain item is missing; ${service} was not started"
+        return 0
+      fi
+      ;;
+  esac
+  case "${service}" in
+    shadow|notifier|web|external-watchdog) kick=1 ;;
+  esac
+  bootstrap_service "${service}" "${kick}"
+}
+
+stop_one() {
+  bootout_service "$1"
+}
+
+restart_one() {
+  stop_one "$1"
+  start_one "$1"
+}
+
+show_status() {
+  local service
+  local domain
+  local web_host
+  local web_port
+  domain="$(launch_domain 2>/dev/null || true)"
+  printf 'app_home: %s\n' "${APP_HOME}"
+  printf 'launch_domain: %s\n' "${domain:-unavailable}"
+  for service in "${SERVICES[@]}"; do
+    if service_is_loaded "${service}"; then
+      printf '%-20s loaded\n' "${service}"
+    else
+      printf '%-20s not-loaded\n' "${service}"
+    fi
+  done
+  web_host="$(runtime_value COINPILOT_WEB_HOST 127.0.0.1)"
+  web_port="$(runtime_value COINPILOT_WEB_PORT 8765)"
+  if command -v curl >/dev/null 2>&1 &&
+      curl --silent --show-error --fail --max-time 2 \
+        "http://${web_host}:${web_port}/health/ready" >/dev/null 2>&1; then
+    printf 'dashboard            ready (http://%s:%s)\n' "${web_host}" "${web_port}"
+  else
+    printf 'dashboard            unavailable (http://%s:%s)\n' "${web_host}" "${web_port}"
+  fi
+}
+
+doctor() {
+  local errors=0
+  local warnings=0
+  local service
+  local host
+  local port
+  local mode
+  local free_kb
+  local total_kb
+  local free_pct
+
+  doctor_ok() { printf 'OK    %s\n' "$*"; }
+  doctor_warn() { printf 'WARN  %s\n' "$*"; warnings=$((warnings + 1)); }
+  doctor_fail() { printf 'FAIL  %s\n' "$*"; errors=$((errors + 1)); }
+
+  if is_macos; then doctor_ok "macOS detected"; else doctor_fail "not running on macOS"; fi
+  if select_python; then
+    doctor_ok "Python >= 3.11: ${PYTHON_BIN}"
+  else
+    doctor_fail "Python >= 3.11 not found"
+  fi
+  if [[ -x "${VENV_DIR}/bin/coinpilot" ]]; then
+    doctor_ok "isolated coinpilot executable exists"
+  else
+    doctor_fail "missing ${VENV_DIR}/bin/coinpilot"
+  fi
+  if cli_has_shadow_commands; then
+    doctor_ok "all shadow CLI commands are present"
+  else
+    doctor_fail "one or more shadow CLI commands are missing"
+  fi
+  if [[ -f "${CONFIG_PATH}" ]]; then doctor_ok "config exists"; else doctor_fail "config missing"; fi
+  if [[ -f "${RUNTIME_ENV}" ]]; then doctor_ok "runtime settings exist"; else doctor_fail "runtime settings missing"; fi
+
+  for mode in "${CONFIG_PATH}" "${RUNTIME_ENV}"; do
+    if [[ -f "${mode}" ]]; then
+      if grep -Eqi 'hooks\.slack|slack[^=]*=[[:space:]]*https://' "${mode}"; then
+        doctor_fail "Slack secret-like URL found in ${mode}; move it to Keychain"
+      fi
+      if is_macos; then
+        if [[ "$(stat -f '%Lp' "${mode}")" == "600" ]]; then
+          doctor_ok "owner-only permissions: ${mode}"
+        else
+          doctor_warn "expected mode 600: ${mode}"
+        fi
+      fi
+    fi
+  done
+
+  if keychain_has_slack; then
+    doctor_ok "Slack webhook exists in Keychain (value not read)"
+  else
+    doctor_warn "Slack webhook Keychain item is missing"
+  fi
+
+  host="$(runtime_value COINPILOT_WEB_HOST 127.0.0.1)"
+  port="$(runtime_value COINPILOT_WEB_PORT 8765)"
+  if [[ "${host}" == "127.0.0.1" ]]; then
+    doctor_ok "dashboard is configured for localhost only"
+  else
+    doctor_fail "dashboard host must be 127.0.0.1, found ${host}"
+  fi
+
+  for service in "${SERVICES[@]}"; do
+    if service_is_loaded "${service}"; then
+      doctor_ok "launchd loaded: ${service}"
+    elif service_enabled "${service}"; then
+      if [[ "${service}" == "notifier" ]]; then
+        doctor_warn "launchd not loaded: ${service}"
+      else
+        doctor_fail "launchd not loaded: ${service}"
+      fi
+    fi
+  done
+
+  if command -v curl >/dev/null 2>&1 &&
+      curl --silent --show-error --fail --max-time 2 \
+        "http://${host}:${port}/health/ready" >/dev/null 2>&1; then
+    doctor_ok "dashboard readiness endpoint responds"
+  else
+    doctor_warn "dashboard readiness endpoint is unavailable"
+  fi
+
+  if [[ -d "${APP_HOME}" ]]; then
+    total_kb="$(df -Pk "${APP_HOME}" | awk 'NR==2 {print $2}')"
+    free_kb="$(df -Pk "${APP_HOME}" | awk 'NR==2 {print $4}')"
+    if [[ -n "${total_kb}" && "${total_kb}" -gt 0 ]]; then
+      free_pct=$((free_kb * 100 / total_kb))
+      if [[ "${free_pct}" -ge 20 ]]; then
+        doctor_ok "disk free: ${free_pct}%"
+      elif [[ "${free_pct}" -ge 10 ]]; then
+        doctor_warn "disk free is low: ${free_pct}%"
+      else
+        doctor_fail "disk free is critically low: ${free_pct}%"
+      fi
+    fi
+  fi
+
+  if command -v pmset >/dev/null 2>&1; then
+    if pmset -g custom 2>/dev/null | grep -Eq 'sleep[[:space:]]+0'; then
+      doctor_ok "at least one power profile prevents system sleep"
+    else
+      doctor_warn "verify Energy settings prevent sleep while the display is off"
+    fi
+  fi
+
+  printf '\nDoctor summary: %d error(s), %d warning(s)\n' "${errors}" "${warnings}"
+  [[ "${errors}" -eq 0 ]]
+}
+
+show_logs() {
+  local service="${1:-shadow}"
+  local stdout_log="${LOG_DIR}/${service}.stdout.log"
+  local stderr_log="${LOG_DIR}/${service}.stderr.log"
+  local files=()
+  validate_service_name "${service}"
+  if [[ ! -f "${stdout_log}" && ! -f "${stderr_log}" ]]; then
+    die "no logs yet for ${service} in ${LOG_DIR}"
+  fi
+  if [[ -f "${stdout_log}" ]]; then files[${#files[@]}]="${stdout_log}"; fi
+  if [[ -f "${stderr_log}" ]]; then files[${#files[@]}]="${stderr_log}"; fi
+  if [[ "${FOLLOW}" -eq 1 ]]; then
+    tail -n 100 -F "${files[@]}"
+  else
+    tail -n 100 "${files[@]}"
+  fi
+}
+
+slack_action() {
+  local action="${1:-check}"
+  local helper="${REPO_ROOT}/scripts/mac-studio-keychain"
+  [[ -x "${helper}" ]] || die "missing executable helper: ${helper}"
+  case "${action}" in
+    check)
+      "${helper}" check --account "${KEYCHAIN_ACCOUNT}" --service "${KEYCHAIN_SERVICE}"
+      ;;
+    set|delete)
+      if [[ "${APPLY}" -eq 0 ]]; then
+        quote_cmd "${helper}" "${action}" --account "${KEYCHAIN_ACCOUNT}" \
+          --service "${KEYCHAIN_SERVICE}"
+        note "Dry-run only. Rerun with --apply."
+      else
+        "${helper}" "${action}" --account "${KEYCHAIN_ACCOUNT}" \
+          --service "${KEYCHAIN_SERVICE}"
+        if [[ "${action}" == "set" && -f "$(plist_path notifier)" ]]; then
+          note "Reloading Slack notifier"
+          bootstrap_service notifier 1
+        elif [[ "${action}" == "delete" ]]; then
+          note "Stopping Slack notifier so the removed secret is not retained"
+          bootout_service notifier
+        fi
+      fi
+      ;;
+    *)
+      die "slack expects set, check, or delete"
+      ;;
+  esac
+}
+
+run_helper_mutation() {
+  local helper="$1"
+  shift
+  [[ -x "${helper}" ]] || die "missing helper: ${helper}"
+  if [[ "${APPLY}" -eq 1 ]]; then
+    "${helper}" "$@" --apply --home "${APP_HOME}"
+  else
+    "${helper}" "$@" --home "${APP_HOME}"
+  fi
+}
+
+case "${COMMAND}" in
+  help|"")
+    usage
+    ;;
+  bootstrap)
+    install_all 1
+    ;;
+  install)
+    install_all 0
+    ;;
+  update)
+    require_macos_for_apply
+    git_update
+    install_all 0
+    ;;
+  uninstall)
+    uninstall_services
+    ;;
+  doctor)
+    doctor
+    ;;
+  status)
+    show_status
+    ;;
+  start)
+    require_macos_for_apply
+    for_each_service start_one "${POSITIONAL[0]:-all}"
+    if [[ "${APPLY}" -eq 0 ]]; then note "Dry-run only. Rerun with --apply."; fi
+    ;;
+  stop)
+    require_macos_for_apply
+    for_each_service stop_one "${POSITIONAL[0]:-all}"
+    if [[ "${APPLY}" -eq 0 ]]; then note "Dry-run only. Rerun with --apply."; fi
+    ;;
+  restart)
+    require_macos_for_apply
+    for_each_service restart_one "${POSITIONAL[0]:-all}"
+    if [[ "${APPLY}" -eq 0 ]]; then note "Dry-run only. Rerun with --apply."; fi
+    ;;
+  logs)
+    show_logs "${POSITIONAL[0]:-shadow}"
+    ;;
+  slack)
+    slack_action "${POSITIONAL[0]:-check}"
+    ;;
+  backup)
+    run_helper_mutation "${REPO_ROOT}/scripts/mac-studio-backup"
+    ;;
+  retention)
+    run_helper_mutation "${REPO_ROOT}/scripts/mac-studio-retention"
+    ;;
+  test)
+    "${REPO_ROOT}/scripts/test-mac-studio-ops.sh"
+    ;;
+  *)
+    echo "error: unknown command: ${COMMAND}" >&2
+    usage >&2
+    exit 64
+    ;;
+esac

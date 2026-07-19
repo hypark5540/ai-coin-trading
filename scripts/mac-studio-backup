@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+#
+# Consistent SQLite online backup. Dry-run by default.
+
+set -euo pipefail
+IFS=$'\n\t'
+umask 077
+
+APP_HOME="${COINPILOT_HOME:-${HOME}/Library/Application Support/Coinpilot}"
+APPLY=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply) APPLY=1 ;;
+    --dry-run) APPLY=0 ;;
+    --home)
+      [[ $# -ge 2 ]] || { echo "error: --home requires a path" >&2; exit 64; }
+      APP_HOME="$2"
+      shift
+      ;;
+    *) echo "error: unknown option: $1" >&2; exit 64 ;;
+  esac
+  shift
+done
+
+CONFIG_PATH="${APP_HOME}/config/config.toml"
+BACKUP_DIR="${APP_HOME}/backups"
+STATE_DIR="${APP_HOME}/state"
+VENV_PYTHON="${APP_HOME}/venv/bin/python"
+
+DB_PATH="${APP_HOME}/data/shadow.db"
+if [[ -x "${VENV_PYTHON}" && -f "${CONFIG_PATH}" ]]; then
+  DB_PATH="$("${VENV_PYTHON}" - "${CONFIG_PATH}" shadow.database_path <<'PY'
+import pathlib
+import sys
+import tomllib
+
+config = tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+section, key = sys.argv[2].split(".", 1)
+print(config[section][key])
+PY
+)"
+  BACKUP_DIR="$("${VENV_PYTHON}" - "${CONFIG_PATH}" operations.backup_dir <<'PY'
+import pathlib
+import sys
+import tomllib
+
+config = tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+section, key = sys.argv[2].split(".", 1)
+print(config[section][key])
+PY
+)"
+fi
+TIMESTAMP="$(date -u '+%Y%m%dT%H%M%SZ')"
+DESTINATION="${BACKUP_DIR}/coinpilot-${TIMESTAMP}.sqlite"
+LOCK_DIR="${STATE_DIR}/backup.lock"
+
+if [[ "${APPLY}" -eq 0 ]]; then
+  printf '[dry-run] SQLite online backup %q -> %q\n' "${DB_PATH}" "${DESTINATION}"
+  exit 0
+fi
+
+if [[ ! -f "${DB_PATH}" ]]; then
+  echo "No database yet; backup skipped: ${DB_PATH}"
+  exit 0
+fi
+if [[ ! -x "${VENV_PYTHON}" ]]; then
+  echo "error: Python environment missing: ${VENV_PYTHON}" >&2
+  exit 1
+fi
+
+mkdir -p "${BACKUP_DIR}" "${STATE_DIR}"
+chmod 700 "${BACKUP_DIR}" "${STATE_DIR}"
+
+if ! mkdir "${LOCK_DIR}" 2>/dev/null; then
+  if [[ -f "${LOCK_DIR}/pid" ]] &&
+      kill -0 "$(sed -n '1p' "${LOCK_DIR}/pid")" 2>/dev/null; then
+    echo "error: another backup is running" >&2
+    exit 1
+  fi
+  rm -f "${LOCK_DIR}/pid"
+  rmdir "${LOCK_DIR}" 2>/dev/null || {
+    echo "error: stale backup lock could not be cleared: ${LOCK_DIR}" >&2
+    exit 1
+  }
+  mkdir "${LOCK_DIR}"
+fi
+printf '%s\n' "$$" > "${LOCK_DIR}/pid"
+cleanup() {
+  rm -f "${LOCK_DIR}/pid"
+  rmdir "${LOCK_DIR}" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+
+"${VENV_PYTHON}" - "${DB_PATH}" "${DESTINATION}" <<'PY'
+import hashlib
+import os
+import pathlib
+import sqlite3
+import sys
+
+source_path = pathlib.Path(sys.argv[1]).resolve()
+destination = pathlib.Path(sys.argv[2]).resolve()
+temporary = destination.with_name(destination.name + ".partial")
+temporary.unlink(missing_ok=True)
+
+source_uri = f"file:{source_path.as_posix()}?mode=ro"
+source = sqlite3.connect(source_uri, uri=True, timeout=30)
+target = sqlite3.connect(temporary)
+try:
+    source.backup(target)
+    result = target.execute("PRAGMA integrity_check").fetchone()
+    if not result or result[0] != "ok":
+        raise RuntimeError(f"backup integrity_check failed: {result!r}")
+finally:
+    target.close()
+    source.close()
+
+os.chmod(temporary, 0o600)
+os.replace(temporary, destination)
+digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+checksum = destination.with_name(destination.name + ".sha256")
+checksum_tmp = checksum.with_name(checksum.name + ".tmp")
+checksum_tmp.write_text(f"{digest}  {destination.name}\n", encoding="ascii")
+os.chmod(checksum_tmp, 0o600)
+os.replace(checksum_tmp, checksum)
+PY
+
+echo "Verified backup created: ${DESTINATION}"

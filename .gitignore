@@ -1,0 +1,21 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+config.toml
+config.local.toml
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Runtime data and generated reports
+data/
+var/
+artifacts/

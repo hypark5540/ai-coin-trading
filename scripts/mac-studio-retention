@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+#
+# Bounded retention and best-effort log rotation. Dry-run by default.
+
+set -euo pipefail
+IFS=$'\n\t'
+umask 077
+
+APP_HOME="${COINPILOT_HOME:-${HOME}/Library/Application Support/Coinpilot}"
+APPLY=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply) APPLY=1 ;;
+    --dry-run) APPLY=0 ;;
+    --home)
+      [[ $# -ge 2 ]] || { echo "error: --home requires a path" >&2; exit 64; }
+      APP_HOME="$2"
+      shift
+      ;;
+    *) echo "error: unknown option: $1" >&2; exit 64 ;;
+  esac
+  shift
+done
+
+RUNTIME_ENV="${APP_HOME}/config/runtime.env"
+CONFIG_PATH="${APP_HOME}/config/config.toml"
+VENV_PYTHON="${APP_HOME}/venv/bin/python"
+DEFAULT_LOG_DIR="${HOME}/Library/Logs/Coinpilot"
+MANAGED_SENTINEL=".coinpilot-managed"
+
+runtime_value() {
+  local key="$1"
+  local fallback="$2"
+  local value=""
+  if [[ -f "${RUNTIME_ENV}" ]]; then
+    value="$(awk -F= -v wanted="${key}" '
+      $0 !~ /^[[:space:]]*#/ && $1 == wanted {
+        sub(/^[^=]*=/, "")
+        print
+        exit
+      }
+    ' "${RUNTIME_ENV}")"
+  fi
+  if [[ -n "${value}" ]]; then printf '%s' "${value}"; else printf '%s' "${fallback}"; fi
+}
+
+RAW_DIR="${APP_HOME}/data/raw"
+BACKUP_DIR="${APP_HOME}/backups"
+LOG_DIR="${COINPILOT_LOG_DIR:-${DEFAULT_LOG_DIR}}"
+RAW_DAYS="$(runtime_value COINPILOT_RETENTION_DAYS 90)"
+BACKUP_DAYS="$(runtime_value COINPILOT_BACKUP_RETENTION_DAYS 35)"
+LOG_DAYS="$(runtime_value COINPILOT_LOG_RETENTION_DAYS 30)"
+LOG_MAX_MB="$(runtime_value COINPILOT_LOG_MAX_MB 100)"
+
+if [[ -x "${VENV_PYTHON}" && -f "${CONFIG_PATH}" ]]; then
+  read_config_value() {
+    "${VENV_PYTHON}" - "${CONFIG_PATH}" "$1" <<'PY'
+import pathlib
+import sys
+import tomllib
+
+config = tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+section, key = sys.argv[2].split(".", 1)
+print(config[section][key])
+PY
+  }
+  RAW_DIR="$(read_config_value shadow.archive_root)"
+  BACKUP_DIR="$(read_config_value operations.backup_dir)"
+  RAW_DAYS="$(read_config_value operations.archive_retention_days)"
+fi
+
+require_uint() {
+  case "$2" in
+    ''|*[!0-9]*) echo "error: $1 must be a non-negative integer" >&2; exit 1 ;;
+  esac
+}
+require_uint COINPILOT_RETENTION_DAYS "${RAW_DAYS}"
+require_uint COINPILOT_BACKUP_RETENTION_DAYS "${BACKUP_DAYS}"
+require_uint COINPILOT_LOG_RETENTION_DAYS "${LOG_DAYS}"
+require_uint COINPILOT_LOG_MAX_MB "${LOG_MAX_MB}"
+
+CANONICAL_PYTHON="${VENV_PYTHON}"
+if [[ ! -x "${CANONICAL_PYTHON}" ]]; then
+  CANONICAL_PYTHON="$(command -v python3 || true)"
+fi
+[[ -n "${CANONICAL_PYTHON}" ]] || {
+  echo "error: Python 3 is required for safe path resolution" >&2
+  exit 1
+}
+
+canonical_path() {
+  "${CANONICAL_PYTHON}" - "$1" <<'PY'
+import os
+import sys
+
+print(os.path.realpath(os.path.abspath(os.path.expanduser(sys.argv[1]))))
+PY
+}
+
+APP_HOME_CANONICAL="$(canonical_path "${APP_HOME}")"
+DEFAULT_LOG_CANONICAL="$(canonical_path "${DEFAULT_LOG_DIR}")"
+HOME_CANONICAL="$(canonical_path "${HOME}")"
+
+if [[ "${APP_HOME_CANONICAL}" == "/" ||
+      "${APP_HOME_CANONICAL}" == "${HOME_CANONICAL}" ]]; then
+  echo "error: refusing unsafe application home: ${APP_HOME_CANONICAL}" >&2
+  exit 1
+fi
+
+managed_directory() {
+  local directory="$1"
+  local kind="$2"
+  local canonical
+  local marker
+  [[ -d "${directory}" ]] || return 1
+  if [[ -L "${directory}" ]]; then
+    echo "error: refusing symlinked ${kind} directory: ${directory}" >&2
+    exit 1
+  fi
+  canonical="$(canonical_path "${directory}")"
+  if [[ "${canonical}" == "/" ||
+        "${canonical}" == "${HOME_CANONICAL}" ||
+        "${canonical}" == "${APP_HOME_CANONICAL}" ]]; then
+    echo "error: refusing broad ${kind} directory: ${canonical}" >&2
+    exit 1
+  fi
+  case "${kind}" in
+    raw|backup)
+      case "${canonical}" in
+        "${APP_HOME_CANONICAL}"/*) ;;
+        *)
+          echo "error: ${kind} directory must be below ${APP_HOME_CANONICAL}: ${canonical}" >&2
+          exit 1
+          ;;
+      esac
+      ;;
+    log)
+      case "${canonical}" in
+        "${DEFAULT_LOG_CANONICAL}"|"${APP_HOME_CANONICAL}"/*) ;;
+        *)
+          echo "error: log directory is outside the managed boundaries: ${canonical}" >&2
+          exit 1
+          ;;
+      esac
+      ;;
+    *)
+      echo "error: unknown managed directory kind: ${kind}" >&2
+      exit 1
+      ;;
+  esac
+  marker="${canonical}/${MANAGED_SENTINEL}"
+  if [[ ! -f "${marker}" || -L "${marker}" || ! -O "${canonical}" || ! -O "${marker}" ]] ||
+      [[ "$(< "${marker}")" != "coinpilot-managed-v1" ]]; then
+    echo "error: refusing unmanaged ${kind} directory: ${canonical}" >&2
+    exit 1
+  fi
+  printf '%s' "${canonical}"
+}
+
+prune_files() {
+  local directory="$1"
+  local days="$2"
+  local description="$3"
+  local kind="$4"
+  local canonical
+  [[ -d "${directory}" ]] || return 0
+  canonical="$(managed_directory "${directory}" "${kind}")"
+  echo "${description} older than ${days} day(s):"
+  if [[ "${APPLY}" -eq 1 ]]; then
+    while IFS= read -r -d '' candidate; do
+      printf '%s\n' "${candidate}"
+      rm -f -- "${candidate}"
+    done < <(
+      find -P "${canonical}" \
+        \( -type d \( -name '.audit-journal' -o -name '.audit-quarantine' \) \) \
+        -prune -o \
+        -type f \
+        ! -name "${MANAGED_SENTINEL}" \
+        ! -name '*.stdout.log' \
+        ! -name '*.stderr.log' \
+        -mtime "+${days}" -print0
+    )
+  else
+    find -P "${canonical}" \
+      \( -type d \( -name '.audit-journal' -o -name '.audit-quarantine' \) \) \
+      -prune -o \
+      -type f \
+      ! -name "${MANAGED_SENTINEL}" \
+      ! -name '*.stdout.log' \
+      ! -name '*.stderr.log' \
+      -mtime "+${days}" -print
+  fi
+}
+
+rotate_logs() {
+  local logfile
+  local bytes
+  local max_bytes
+  local timestamp
+  local rotated
+  [[ -d "${LOG_DIR}" ]] || return 0
+  LOG_DIR="$(managed_directory "${LOG_DIR}" log)"
+  max_bytes=$((LOG_MAX_MB * 1024 * 1024))
+  timestamp="$(date -u '+%Y%m%dT%H%M%SZ')"
+  for logfile in "${LOG_DIR}"/*.stdout.log "${LOG_DIR}"/*.stderr.log; do
+    [[ -f "${logfile}" && ! -L "${logfile}" ]] || continue
+    bytes="$(wc -c < "${logfile}" | tr -d '[:space:]')"
+    if [[ "${bytes}" -gt "${max_bytes}" ]]; then
+      rotated="${logfile}.${timestamp}"
+      if [[ "${APPLY}" -eq 1 ]]; then
+        cp -p "${logfile}" "${rotated}"
+        : > "${logfile}"
+        chmod 600 "${logfile}" "${rotated}"
+        gzip -f "${rotated}"
+        echo "rotated ${logfile}"
+      else
+        printf '[dry-run] rotate %s (%s bytes) -> %s.gz\n' \
+          "${logfile}" "${bytes}" "${rotated}"
+      fi
+    fi
+  done
+}
+
+rotate_logs
+prune_files "${RAW_DIR}" "${RAW_DAYS}" "Raw capture files" raw
+prune_files "${BACKUP_DIR}" "${BACKUP_DAYS}" "Verified backup files" backup
+prune_files "${LOG_DIR}" "${LOG_DAYS}" "Rotated log files" log
+
+if [[ "${APPLY}" -eq 0 ]]; then
+  echo "Dry-run only. Rerun with --apply to prune the files listed above."
+fi

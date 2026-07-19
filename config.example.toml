@@ -1,0 +1,96 @@
+[data]
+market = "KRW-BTC"
+interval_minutes = 60
+candle_count = 26300
+api_base_url = "https://api.upbit.com"
+request_timeout_seconds = 10.0
+database_path = "var/coinpilot.db"
+
+[model]
+# Directly forecast the 72-hour gross return, then subtract round-trip costs
+# and a calibration uncertainty buffer before a signal can trade.
+signal_mode = "expected_return"
+horizon_bars = 72
+min_train_samples = 3000
+train_window = 8760
+retrain_every = 168
+entry_probability = 0.58
+exit_probability = 0.48
+minimum_edge_pct = 0.0015
+l2 = 0.10
+learning_rate = 0.08
+max_iterations = 250
+calibration_window = 720
+calibration_min_samples = 480
+calibration_uncertainty_z = 1.0
+target_clip_quantile = 0.01
+# Long-only entries require price to be above its trailing seven-day mean.
+regime_sma_window = 168
+regime_sma_gap_min = 0.0
+
+[risk]
+initial_cash = 10000000
+risk_per_trade = 0.0075
+max_position_fraction = 0.50
+atr_stop_multiple = 2.0
+minimum_stop_pct = 0.01
+maximum_stop_pct = 0.08
+trailing_stop_pct = 0.08
+max_strategy_drawdown_pct = 0.15
+fee_rate = 0.0005
+slippage_bps = 5.0
+cooldown_bars = 6
+minimum_order_quote = 5000
+
+[paper]
+# Must cover the model train window, 168-bar feature warm-up, horizon, and
+# worst-case wait until the next absolute retraining slot.
+history_candles = 12000
+poll_seconds = 30
+max_signal_delay_seconds = 120
+max_ticker_age_seconds = 60
+account_name = "default"
+
+[output]
+artifacts_dir = "artifacts"
+
+[shadow]
+# Safe default: collect and monitor only. Change to "diagnostic" only after
+# reviewing the runbook; diagnostic fills are simulated and are not an alpha
+# or profitability claim.
+mode = "observe"
+database_path = "var/shadow.db"
+archive_root = "var/hft/archive"
+initial_cash = 10000000
+order_quote = 250000
+fee_rate = 0.0005
+latency_ms = 100
+max_book_gap_ms = 1000
+warmup_books = 100
+trade_flow_window_ms = 1000
+entry_threshold = 0.45
+exit_threshold = 0.0
+max_holding_seconds = 60
+max_spread_bps = 10
+max_daily_loss_pct = 0.01
+max_drawdown_pct = 0.05
+equity_sample_seconds = 5
+health_sample_seconds = 10
+partition_seconds = 300
+session_seconds = 31536000
+model_version = "diagnostic-imbalance-flow-v0"
+
+[operations]
+# The application rejects non-loopback binds. Use an SSH tunnel or Tailscale
+# rather than exposing this port directly.
+bind_host = "127.0.0.1"
+port = 8765
+heartbeat_seconds = 10
+stale_after_seconds = 60
+notifier_poll_seconds = 2
+keychain_service = "coinpilot-slack-webhook"
+keychain_account = "coinpilot-shadow"
+backup_dir = "var/backups"
+archive_retention_days = 90
+disk_warning_pct = 0.15
+disk_halt_pct = 0.05

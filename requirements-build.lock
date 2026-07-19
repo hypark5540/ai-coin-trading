@@ -1,0 +1,5 @@
+# Build/bootstrap tools used before the no-build-isolation editable install.
+pip==26.1.2
+setuptools==83.0.0
+packaging==26.2
+wheel==0.47.0

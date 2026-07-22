@@ -365,7 +365,9 @@ shadow 전용 운용을 전제로 한 저소음 설정이다. 외부 dead-man �
 전략, 모델, 위험 설정을 변경하면 기존 shadow 결과와 같은 검증 구간으로
 이어붙이지 말고 새 run/account로 시작한다. 구체적으로 서비스를 멈춘 뒤
 `shadow.database_path`를 이전 파일과 다른 새 경로로 바꾼다. 기존 DB는
-감사·비교용으로 보존한다.
+감사·비교용으로 보존한다. named instance에서는 새 경로를 해당 instance의
+`data` 디렉터리 바로 아래 `shadow-<version>.db` 형식으로 지정한다. 다른
+디렉터리, symlink, paper DB 재사용은 설치기와 시작 전 검증에서 거부한다.
 
 ## 일상 운영
 

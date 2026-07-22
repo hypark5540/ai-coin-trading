@@ -291,6 +291,43 @@ def _public_status(status: Mapping[str, Any], *, now_wall_ns: int) -> dict[str, 
     return result
 
 
+def _with_readiness(
+    status: Mapping[str, Any],
+    *,
+    stale_after_seconds: int,
+) -> dict[str, Any]:
+    """Add orthogonal feed-freshness and strategy-readiness fields."""
+
+    result = dict(status)
+    feed_age = result.get("feed_age_seconds")
+    feed_fresh = (
+        feed_age is not None
+        and float(feed_age) <= stale_after_seconds
+    )
+    lifecycle = str(result.get("lifecycle_status") or "unknown")
+    ready = lifecycle == "running" and feed_fresh
+    if ready:
+        reason = "ready"
+    elif lifecycle in {"halted_recovery", "stopped"}:
+        reason = lifecycle
+    elif feed_age is None:
+        reason = "feed_unavailable"
+    elif not feed_fresh:
+        reason = "feed_stale"
+    elif lifecycle == "warmup":
+        reason = lifecycle
+    else:
+        reason = "lifecycle_not_running"
+    result.update(
+        {
+            "ready": ready,
+            "feed_fresh": feed_fresh,
+            "readiness_reason": reason,
+        }
+    )
+    return result
+
+
 def make_status_handler(
     store: ShadowStore,
     *,
@@ -354,18 +391,25 @@ def make_status_handler(
                 return
             run_id = store.latest_run_id(market)
             if run_id is None:
-                self._json(503, {"error": "no_shadow_run", "orders_sent": 0})
+                self._json(
+                    503,
+                    {
+                        "error": "no_shadow_run",
+                        "ready": False,
+                        "feed_fresh": False,
+                        "readiness_reason": "no_shadow_run",
+                        "orders_sent": 0,
+                    },
+                )
                 return
             now = wall_time_ns()
             status = store.read_status(run_id)
-            public = _public_status(status, now_wall_ns=now)
+            public = _with_readiness(
+                _public_status(status, now_wall_ns=now),
+                stale_after_seconds=stale_after_seconds,
+            )
             if path in {"/readyz", "/health/ready"}:
-                ready = (
-                    public.get("lifecycle_status") == "running"
-                    and public.get("feed_age_seconds") is not None
-                    and float(public["feed_age_seconds"]) <= stale_after_seconds
-                )
-                self._json(200 if ready else 503, {"ready": ready, **public})
+                self._json(200 if public["ready"] else 503, public)
                 return
             if path in {"/healthz", "/api/status"}:
                 self._json(200, public)

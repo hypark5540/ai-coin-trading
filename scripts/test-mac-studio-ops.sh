@@ -483,6 +483,119 @@ if [[ -e "${NAMED_APP_HOME}" ]]; then
 fi
 echo "OK named instance dry-run is isolated and non-editable"
 
+VALIDATOR_ROOT="$(cd "${TMP_ROOT}" && pwd -P)/named-shadow-paths"
+VALIDATOR_PYTHON="$(command -v python3.12 || command -v python3)"
+
+write_named_validator_config() {
+  local app_home="$1"
+  local shadow_database="$2"
+  mkdir -p \
+    "${app_home}/config" \
+    "${app_home}/data/raw" \
+    "${app_home}/backups" \
+    "${app_home}/logs"
+  cat > "${app_home}/config/config.toml" <<EOF
+[data]
+market = "KRW-BTC"
+database_path = "${app_home}/data/coinpilot.db"
+
+[risk]
+initial_cash = 5000000
+
+[shadow]
+mode = "diagnostic"
+database_path = "${shadow_database}"
+archive_root = "${app_home}/data/raw"
+initial_cash = 5000000
+order_quote = 25000
+
+[operations]
+bind_host = "127.0.0.1"
+port = 18766
+backup_dir = "${app_home}/backups"
+EOF
+  cat > "${app_home}/config/runtime.env" <<EOF
+COINPILOT_WEB_HOST=127.0.0.1
+COINPILOT_WEB_PORT=18766
+COINPILOT_LOG_DIR=${app_home}/logs
+COINPILOT_ENABLE_SHADOW=0
+COINPILOT_ENABLE_PAPER=0
+COINPILOT_ENABLE_NOTIFIER=0
+COINPILOT_ENABLE_WEB=0
+COINPILOT_ENABLE_WATCHDOG=0
+EOF
+}
+
+run_named_validator_doctor() {
+  local app_home="$1"
+  local output="$2"
+  COINPILOT_PYTHON="${VALIDATOR_PYTHON}" \
+    HOME="${VALIDATOR_ROOT}/home" \
+    "${REPO_ROOT}/scripts/mac-studio" doctor \
+    --instance validator --home "${app_home}" > "${output}" 2>&1 || true
+}
+
+VERSIONED_APP="${VALIDATOR_ROOT}/versioned"
+write_named_validator_config \
+  "${VERSIONED_APP}" \
+  "${VERSIONED_APP}/data/shadow-diagnostic-bounded-v1-a1b2c3d4e5f6.db"
+run_named_validator_doctor \
+  "${VERSIONED_APP}" "${VALIDATOR_ROOT}/versioned.log"
+grep -Fq 'OK    named instance paths and capital boundaries are isolated' \
+  "${VALIDATOR_ROOT}/versioned.log"
+
+NESTED_APP="${VALIDATOR_ROOT}/nested"
+write_named_validator_config \
+  "${NESTED_APP}" "${NESTED_APP}/data/v2/shadow-v2.db"
+run_named_validator_doctor "${NESTED_APP}" "${VALIDATOR_ROOT}/nested.log"
+grep -Fq 'shadow.database_path must be directly inside' \
+  "${VALIDATOR_ROOT}/nested.log"
+grep -Fq 'FAIL  named instance configuration failed isolation validation' \
+  "${VALIDATOR_ROOT}/nested.log"
+
+OUTSIDE_APP="${VALIDATOR_ROOT}/outside-app"
+OUTSIDE_DATABASE="${VALIDATOR_ROOT}/outside-data/shadow-v2.db"
+write_named_validator_config "${OUTSIDE_APP}" "${OUTSIDE_DATABASE}"
+run_named_validator_doctor "${OUTSIDE_APP}" "${VALIDATOR_ROOT}/outside.log"
+grep -Fq 'shadow.database_path escapes instance home' \
+  "${VALIDATOR_ROOT}/outside.log"
+grep -Fq 'FAIL  named instance configuration failed isolation validation' \
+  "${VALIDATOR_ROOT}/outside.log"
+
+SYMLINK_APP="${VALIDATOR_ROOT}/symlink"
+SYMLINK_DATABASE="${SYMLINK_APP}/data/shadow-v2.db"
+write_named_validator_config "${SYMLINK_APP}" "${SYMLINK_DATABASE}"
+mkdir -p "${VALIDATOR_ROOT}/symlink-target"
+ln -s \
+  "${VALIDATOR_ROOT}/symlink-target/shadow-v2.db" \
+  "${SYMLINK_DATABASE}"
+run_named_validator_doctor "${SYMLINK_APP}" "${VALIDATOR_ROOT}/symlink.log"
+grep -Fq 'symlinked managed path' "${VALIDATOR_ROOT}/symlink.log"
+grep -Fq 'FAIL  named instance configuration failed isolation validation' \
+  "${VALIDATOR_ROOT}/symlink.log"
+
+HARDLINK_APP="${VALIDATOR_ROOT}/hardlink"
+HARDLINK_DATABASE="${HARDLINK_APP}/data/shadow-v2.db"
+write_named_validator_config "${HARDLINK_APP}" "${HARDLINK_DATABASE}"
+touch "${HARDLINK_APP}/data/coinpilot.db"
+ln "${HARDLINK_APP}/data/coinpilot.db" "${HARDLINK_DATABASE}"
+run_named_validator_doctor "${HARDLINK_APP}" "${VALIDATOR_ROOT}/hardlink.log"
+grep -Fq 'shadow.database_path must not be hard-linked' \
+  "${VALIDATOR_ROOT}/hardlink.log"
+grep -Fq 'FAIL  named instance configuration failed isolation validation' \
+  "${VALIDATOR_ROOT}/hardlink.log"
+
+UNSAFE_APP="${VALIDATOR_ROOT}/unsafe-name"
+write_named_validator_config \
+  "${UNSAFE_APP}" "${UNSAFE_APP}/data/ledger-v2.db"
+run_named_validator_doctor "${UNSAFE_APP}" "${VALIDATOR_ROOT}/unsafe-name.log"
+grep -Fq \
+  'shadow.database_path filename must be shadow.db or shadow-<version>.db' \
+  "${VALIDATOR_ROOT}/unsafe-name.log"
+grep -Fq 'FAIL  named instance configuration failed isolation validation' \
+  "${VALIDATOR_ROOT}/unsafe-name.log"
+echo "OK named shadow database version and path boundaries"
+
 if HOME="${NAMED_TEST_HOME}" "${REPO_ROOT}/scripts/mac-studio" bootstrap \
     --instance btc --market KRW-BTC --initial-cash 5000000 \
     --order-quote 125000 --shadow-mode diagnostic --web-port 8766 \

@@ -208,6 +208,15 @@ def test_dashboard_root_is_a_self_contained_read_only_interface() -> None:
     )
     for safety_field in ("simulated", "orders_sent", "live_order_routing"):
         assert safety_field in dashboard
+    for readiness_field in ("feed_fresh", "readiness_reason"):
+        assert readiness_field in dashboard
+    for distinct_state in (
+        "Live · warming up",
+        "Feed stale",
+        "Waiting for feed",
+        "Shadow stopped",
+    ):
+        assert distinct_state in dashboard
 
 
 def test_dashboard_uses_configured_market_units_before_first_status() -> None:
@@ -249,6 +258,98 @@ class _MarketStore:
 
     def read_equity(self, run_id, *, limit):
         return [{"run_id": run_id, "limit": limit}]
+
+
+class _ReadinessStore:
+    def __init__(self, status):
+        self.status = status
+
+    def latest_run_id(self, market):
+        return "status-run"
+
+    def read_status(self, run_id):
+        assert run_id == "status-run"
+        return {
+            "run_id": run_id,
+            "market": "KRW-BTC",
+            "status": self.status["lifecycle_status"],
+            "started_wall_ns": 1,
+            "live_order_routing": False,
+            **self.status,
+        }
+
+
+@pytest.mark.parametrize(
+    (
+        "lifecycle",
+        "last_book_wall_ns",
+        "expected_ready",
+        "expected_fresh",
+        "expected_reason",
+    ),
+    [
+        ("running", 99_000_000_000, True, True, "ready"),
+        ("warmup", 99_000_000_000, False, True, "warmup"),
+        ("halted_recovery", 99_000_000_000, False, True, "halted_recovery"),
+        ("halted_recovery", 39_000_000_000, False, False, "halted_recovery"),
+        ("stopped", 99_000_000_000, False, True, "stopped"),
+        ("stopped", 39_000_000_000, False, False, "stopped"),
+        ("running", 39_000_000_000, False, False, "feed_stale"),
+        ("warmup", None, False, False, "feed_unavailable"),
+    ],
+)
+def test_status_api_separates_feed_freshness_from_strategy_readiness(
+    lifecycle: str,
+    last_book_wall_ns: int | None,
+    expected_ready: bool,
+    expected_fresh: bool,
+    expected_reason: str,
+) -> None:
+    store = _ReadinessStore(
+        {
+            "lifecycle_status": lifecycle,
+            "last_book_wall_ns": last_book_wall_ns,
+        }
+    )
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        make_status_handler(
+            store,
+            market="KRW-BTC",
+            stale_after_seconds=60,
+            wall_time_ns=lambda: 100_000_000_000,
+        ),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with urllib.request.urlopen(f"{base}/api/status", timeout=2) as response:
+            assert response.status == 200
+            status_payload = json.loads(response.read())
+        try:
+            response = urllib.request.urlopen(
+                f"{base}/health/ready",
+                timeout=2,
+            )
+        except urllib.error.HTTPError as error:
+            ready_status = error.code
+            ready_payload = json.loads(error.read())
+        else:
+            with response:
+                ready_status = response.status
+                ready_payload = json.loads(response.read())
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    expected_status = 200 if expected_ready else 503
+    assert ready_status == expected_status
+    for payload in (status_payload, ready_payload):
+        assert payload["ready"] is expected_ready
+        assert payload["feed_fresh"] is expected_fresh
+        assert payload["readiness_reason"] == expected_reason
 
 
 @pytest.mark.parametrize(
@@ -304,6 +405,10 @@ def test_status_and_watchdog_do_not_fallback_to_another_market() -> None:
                 timeout=2,
             )
         assert raised.value.code == 503
+        payload = json.loads(raised.value.read())
+        assert payload["ready"] is False
+        assert payload["feed_fresh"] is False
+        assert payload["readiness_reason"] == "no_shadow_run"
     finally:
         server.shutdown()
         server.server_close()

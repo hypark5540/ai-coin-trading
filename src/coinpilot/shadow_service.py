@@ -20,6 +20,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from coinpilot.config import AppConfig
+from coinpilot.hft_continuity import is_confirmed_continuity_gap
 from coinpilot.hft_archive import (
     HFTArchiveResult,
     record_upbit_public_archive,
@@ -715,7 +716,10 @@ def _run_shadow_service_locked(
         event = record.get("event")
         event_type = event.get("event_type") if isinstance(event, dict) else None
         if event_type != "orderbook":
-            if record.get("gap_before") is True:
+            if is_confirmed_continuity_gap(
+                gap_before=record.get("gap_before") is True,
+                gap_reason=record.get("gap_reason"),
+            ):
                 intervening_boundary["gap_reason"] = (
                     record.get("gap_reason") or "intervening_event_gap"
                 )

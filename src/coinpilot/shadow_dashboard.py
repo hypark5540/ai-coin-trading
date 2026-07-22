@@ -1143,6 +1143,8 @@ def dashboard_html(market: str) -> bytes:
       configureMarket(status.market || configuredMarket);
       const lifecycle = String(status.lifecycle_status || status.status || "unknown");
       const ready = Boolean(status.ready);
+      const feedFresh = Boolean(status.feed_fresh);
+      const readinessReason = String(status.readiness_reason || "unknown");
       const feedAge = numberOr(status.feed_age_seconds, NaN);
       const equity = numberOr(status.last_equity_quote);
       const cash = numberOr(status.cash_quote);
@@ -1180,8 +1182,20 @@ def dashboard_html(market: str) -> bytes:
       lifecycleChip.textContent = labelize(lifecycle);
 
       const readinessChip = byId("readiness-chip");
-      readinessChip.textContent = ready ? "Ready" : "Not ready";
-      readinessChip.classList.toggle("tone-warning", !ready);
+      const readinessLabels = {
+        ready: "Ready",
+        warmup: "Warming up",
+        halted_recovery: "Halted",
+        stopped: "Stopped",
+        feed_stale: "Feed stale",
+        feed_unavailable: "Waiting for feed",
+        no_shadow_run: "No shadow run"
+      };
+      readinessChip.textContent = readinessLabels[readinessReason] || "Not ready";
+      readinessChip.classList.remove("tone-positive", "tone-negative", "tone-warning");
+      if (ready) readinessChip.classList.add("tone-positive");
+      else if (feedFresh && readinessReason === "warmup") readinessChip.classList.add("tone-warning");
+      else readinessChip.classList.add("tone-negative");
 
       const strategyHealth = Array.isArray(status.health)
         ? status.health.find((item) => item && item.component === "shadow_engine")
@@ -1202,10 +1216,18 @@ def dashboard_html(market: str) -> bytes:
 
       if (ready && !routing && numberOr(status.orders_sent) === 0) {
         setConnection("live", "Live");
-      } else if (!ready) {
-        setConnection("stale", "Stale");
+      } else if (feedFresh && readinessReason === "warmup") {
+        setConnection("live", "Live · warming up");
+      } else if (readinessReason === "halted_recovery") {
+        setConnection("syncing", feedFresh ? "Feed live · halted" : "Shadow halted");
+      } else if (readinessReason === "stopped") {
+        setConnection("stale", "Shadow stopped");
+      } else if (!feedFresh && readinessReason === "feed_unavailable") {
+        setConnection("syncing", "Waiting for feed");
+      } else if (!feedFresh) {
+        setConnection("stale", "Feed stale");
       } else {
-        setConnection("syncing", "Review");
+        setConnection("syncing", "Feed live · not ready");
       }
     }
 

@@ -432,13 +432,11 @@ market = str(
 )
 try:
     with urllib.request.urlopen(
-        f"http://{host}:{port}/health/ready",
+        f"http://{host}:{port}/api/status",
         timeout=2,
     ) as response:
         payload = json.load(response)
 except Exception:
-    raise SystemExit(1)
-if payload.get("ready") is not True:
     raise SystemExit(1)
 if payload.get("market") != market:
     print(
@@ -447,6 +445,7 @@ if payload.get("market") != market:
         file=sys.stderr,
     )
     raise SystemExit(2)
+print(str(payload.get("readiness_reason") or "unknown"))
 PY
 }
 
@@ -708,23 +707,36 @@ config_path = pathlib.Path(sys.argv[2]).expanduser().absolute()
 runtime_path = pathlib.Path(sys.argv[3]).expanduser().absolute()
 expected_paths = {
     ("data", "database_path"): pathlib.Path(sys.argv[4]).expanduser().absolute(),
-    ("shadow", "database_path"): pathlib.Path(sys.argv[5]).expanduser().absolute(),
     ("shadow", "archive_root"): pathlib.Path(sys.argv[6]).expanduser().absolute(),
     ("operations", "backup_dir"): pathlib.Path(sys.argv[7]).expanduser().absolute(),
 }
 config = tomllib.loads(config_path.read_text(encoding="utf-8"))
 errors = []
+default_shadow_database = pathlib.Path(sys.argv[5]).expanduser().absolute()
+data_dir = default_shadow_database.parent
+configured_shadow = pathlib.Path(str(config["shadow"]["database_path"])).expanduser()
+if not configured_shadow.is_absolute():
+    errors.append("shadow.database_path must be absolute")
+shadow_database = configured_shadow.absolute()
 
 def has_symlink_component(path: pathlib.Path) -> bool:
     current = path
     while True:
-        if current.exists() and current.is_symlink():
+        # is_symlink() also catches a dangling final component.  Requiring
+        # exists() here would let a broken link redirect SQLite creation.
+        if current.is_symlink():
             return True
         if current == current.parent:
             return False
         current = current.parent
 
-for path in (app_home, config_path, runtime_path, *expected_paths.values()):
+for path in (
+    app_home,
+    config_path,
+    runtime_path,
+    *expected_paths.values(),
+    shadow_database,
+):
     if has_symlink_component(path):
         errors.append(f"symlinked managed path: {path}")
 
@@ -738,6 +750,34 @@ for (section, key), expected in expected_paths.items():
         actual.relative_to(app_home)
     except ValueError:
         errors.append(f"{section}.{key} escapes instance home: {actual}")
+
+if shadow_database.parent != data_dir:
+    errors.append(
+        f"shadow.database_path must be directly inside {data_dir}, "
+        f"found {shadow_database}"
+    )
+if not re.fullmatch(
+    r"shadow(?:-[A-Za-z0-9][A-Za-z0-9._-]*)?\.db",
+    shadow_database.name,
+):
+    errors.append(
+        "shadow.database_path filename must be shadow.db or shadow-<version>.db"
+    )
+if shadow_database.exists() and not shadow_database.is_file():
+    errors.append(
+        f"shadow.database_path must be a regular file when it exists: "
+        f"{shadow_database}"
+    )
+elif shadow_database.exists() and shadow_database.stat().st_nlink != 1:
+    errors.append(
+        f"shadow.database_path must not be hard-linked: {shadow_database}"
+    )
+try:
+    shadow_database.relative_to(app_home)
+except ValueError:
+    errors.append(f"shadow.database_path escapes instance home: {shadow_database}")
+if shadow_database == expected_paths[("data", "database_path")]:
+    errors.append("shadow.database_path must not reuse data.database_path")
 
 market = str(config["data"]["market"])
 if not re.fullmatch(r"[A-Z0-9]+-[A-Z0-9]+", market):
@@ -1518,6 +1558,7 @@ show_status() {
   local domain
   local web_host
   local web_port
+  local dashboard_state
   local paper_summary
   domain="$(launch_domain 2>/dev/null || true)"
   printf 'instance: %s\n' "${INSTANCE}"
@@ -1538,8 +1579,9 @@ show_status() {
   web_port="$(runtime_value COINPILOT_WEB_PORT 8765)"
   if ! service_enabled web; then
     printf 'dashboard            disabled\n'
-  elif probe_dashboard "${web_host}" "${web_port}" >/dev/null 2>&1; then
-    printf 'dashboard            ready (http://%s:%s)\n' "${web_host}" "${web_port}"
+  elif dashboard_state="$(probe_dashboard "${web_host}" "${web_port}" 2>/dev/null)"; then
+    printf 'dashboard            online (%s; http://%s:%s)\n' \
+      "${dashboard_state}" "${web_host}" "${web_port}"
   else
     printf 'dashboard            unavailable (http://%s:%s)\n' "${web_host}" "${web_port}"
   fi
@@ -1699,13 +1741,16 @@ doctor() {
   if ! service_enabled web; then
     doctor_ok "dashboard service is disabled"
   elif probe_output="$(probe_dashboard "${host}" "${port}" 2>&1)"; then
-    doctor_ok "dashboard readiness endpoint responds"
+    doctor_ok "dashboard status endpoint responds (${probe_output})"
+    if [[ "${probe_output}" != "ready" ]]; then
+      doctor_warn "shadow is not ready (${probe_output})"
+    fi
   else
     probe_status=$?
     if [[ "${probe_status}" -eq 2 ]]; then
       doctor_fail "${probe_output}"
     else
-      doctor_warn "dashboard readiness endpoint is unavailable"
+      doctor_warn "dashboard status endpoint is unavailable"
     fi
   fi
 

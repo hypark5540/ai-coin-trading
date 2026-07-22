@@ -206,6 +206,45 @@ def test_gap_expires_pending_and_rewarms_without_a_fill(tmp_path: Path) -> None:
     assert ready.lifecycle_status == "running"
 
 
+def test_receive_interval_silence_keeps_runtime_ready_but_expires_stale_order(
+    tmp_path: Path,
+) -> None:
+    store, engine = _engine(tmp_path)
+    created = engine.process_book(
+        _book(1, 100),
+        ShadowIntent(
+            action="buy",
+            reason="entry",
+            policy_version="policy-v1",
+            quote_notional=100.0,
+        ),
+    )
+    assert created.order_id is not None
+
+    after_silence = engine.process_book(
+        _book(
+            2,
+            300,
+            gap_before=True,
+            gap_reason="receive_interval",
+        )
+    )
+
+    assert after_silence.continuity_reason is None
+    assert after_silence.lifecycle_status == "running"
+    assert store.recent_fills(engine.run_id) == []
+    order = _row(
+        store.path,
+        "SELECT status, terminal_reason FROM shadow_orders WHERE order_id = ?",
+        (created.order_id,),
+    )
+    assert order["status"] == "expired"
+    assert order["terminal_reason"] == "no_fresh_book_after_latency"
+    status = engine.status()
+    assert status["warmup_books_seen"] == 1
+    assert status["orders_sent"] == 0
+
+
 def test_restart_expires_pending_and_open_position_liquidates_fresh(
     tmp_path: Path,
 ) -> None:

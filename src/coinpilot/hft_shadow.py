@@ -18,6 +18,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
+from coinpilot.hft_continuity import is_confirmed_continuity_gap
 from coinpilot.hft_depth import (
     IndependentTakerOrder,
     PublicOrderBook,
@@ -1360,7 +1361,10 @@ class ShadowEngine:
     ) -> str | None:
         if book.monotonic_regression:
             return "monotonic_regression_marker"
-        if book.gap_before:
+        if is_confirmed_continuity_gap(
+            gap_before=book.gap_before,
+            gap_reason=book.gap_reason,
+        ):
             return f"gap:{book.gap_reason}"
         if state["last_capture_id"] is None:
             return None

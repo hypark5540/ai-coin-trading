@@ -86,8 +86,8 @@
   },
   "schema_version": 1,
   "source_tree": {
-    "aggregate_sha256": "2690e5d00eebf919aced1a729c139f694dc471505530381249bf9fa0dd40e1f9",
-    "file_count": 32,
+    "aggregate_sha256": "23b253e19b595fe0f9f94e0fe03b517a732b852fbd0ffc307d9788dd97900b82",
+    "file_count": 33,
     "scope": "pyproject.toml + sorted src/coinpilot/**/*.py"
   },
   "strategy_id": "C2_TREND_336_168",

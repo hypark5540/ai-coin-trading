@@ -95,6 +95,13 @@ Slack secret이 없으면 notifier만 설치하고 시작하지 않는다. watch
 설정 파일과 plist까지 검토한 뒤 시작하고 싶다면 `bootstrap --apply --no-start`를
 사용하고, 검토 후 `start --apply`를 실행한다.
 
+`stop --apply`와 `--no-start` 설치는 현재 세션에서 job을 내리는 것뿐 아니라
+해당 LaunchAgent를 launchd에 명시적으로 비활성화한다. 따라서 plist의
+`RunAtLoad`가 남아 있어도 다음 로그인이나 재부팅 때 되살아나지 않는다.
+`start --apply`는 검증을 통과한 대상만 다시 명시적으로 활성화한다. Doctor는
+`runtime.env`에서 비활성인 job이 loaded 상태이거나 persistent override가
+disabled가 아니면 오류로 보고한다.
+
 ## BTC + ETH 격리 인스턴스
 
 한 shadow 엔진은 의도적으로 한 시장만 처리한다. 여러 시장을 한 프로세스에

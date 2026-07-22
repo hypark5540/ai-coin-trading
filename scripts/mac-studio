@@ -1022,6 +1022,96 @@ service_label() {
   printf '%s.%s' "${LABEL_PREFIX}" "$1"
 }
 
+service_target() {
+  local service="$1"
+  local domain
+  domain="$(launch_domain 2>/dev/null || true)"
+  printf '%s/%s' "${domain:-gui/$(id -u)}" "$(service_label "${service}")"
+}
+
+LAUNCHCTL_ERROR=""
+LAUNCHD_DISABLED_OVERRIDES=""
+LAUNCHD_DISABLED_OVERRIDES_AVAILABLE=0
+
+set_service_launchd_enabled() {
+  local service="$1"
+  local enabled="$2"
+  local action
+  local launch_error=""
+  local target
+  LAUNCHCTL_ERROR=""
+  if [[ "${enabled}" -eq 1 ]]; then
+    action="enable"
+  else
+    action="disable"
+  fi
+  target="$(service_target "${service}")"
+  if [[ "${APPLY}" -eq 0 ]]; then
+    quote_cmd launchctl "${action}" "${target}"
+  elif ! launch_error="$(launchctl "${action}" "${target}" 2>&1)"; then
+    LAUNCHCTL_ERROR="launchctl ${action} failed for ${service}: ${launch_error}"
+    return 1
+  fi
+}
+
+refresh_launchd_disabled_overrides() {
+  local domain="$1"
+  LAUNCHD_DISABLED_OVERRIDES=""
+  LAUNCHD_DISABLED_OVERRIDES_AVAILABLE=0
+  [[ -n "${domain}" ]] || return 0
+  if LAUNCHD_DISABLED_OVERRIDES="$(
+      LC_ALL=C launchctl print-disabled "${domain}" 2>/dev/null
+    )"; then
+    LAUNCHD_DISABLED_OVERRIDES_AVAILABLE=1
+  fi
+}
+
+service_launchd_override_state() {
+  local service="$1"
+  local label
+  if [[ "${LAUNCHD_DISABLED_OVERRIDES_AVAILABLE}" -ne 1 ]]; then
+    printf '%s' unknown
+    return 0
+  fi
+  label="$(service_label "${service}")"
+  printf '%s\n' "${LAUNCHD_DISABLED_OVERRIDES}" | LC_ALL=C awk \
+    -v wanted="${label}" '
+function trim(value) {
+  sub(/^[[:space:]]+/, "", value)
+  sub(/[[:space:]]+$/, "", value)
+  return value
+}
+{
+  line = $0
+  sub(/\r$/, "", line)
+  separator = index(line, "=>")
+  if (!separator) next
+  key = trim(substr(line, 1, separator - 1))
+  value = trim(substr(line, separator + 2))
+  if (length(key) >= 2 && substr(key, 1, 1) == "\"" &&
+      substr(key, length(key), 1) == "\"") {
+    key = substr(key, 2, length(key) - 2)
+  }
+  if (key != wanted) next
+  sub(/[[:space:]]*[,;][[:space:]]*$/, "", value)
+  value = trim(value)
+  matches += 1
+  if (matches > 1) {
+    state = "unknown"
+  } else if (value == "disabled" || value == "true" || value == "1") {
+    state = "disabled"
+  } else if (value == "enabled" || value == "false" || value == "0") {
+    state = "enabled"
+  } else {
+    state = "unknown"
+  }
+}
+END {
+  if (!matches) print "unset"
+  else print state
+}'
+}
+
 service_is_loaded() {
   local service="$1"
   local domain
@@ -1066,6 +1156,7 @@ bootout_service() {
   local service="$1"
   local domain
   local launch_error=""
+  LAUNCHCTL_ERROR=""
   domain="$(launch_domain 2>/dev/null || true)"
   if [[ -z "${domain}" ]]; then
     if [[ "${APPLY}" -eq 1 ]]; then
@@ -1080,10 +1171,13 @@ bootout_service() {
   elif service_is_loaded "${service}"; then
     if launch_error="$(launchctl bootout \
         "${domain}/$(service_label "${service}")" 2>&1)"; then
-      wait_for_service_unloaded "${service}" ||
-        die "launchctl bootout did not finish for ${service} within 30 seconds"
+      if ! wait_for_service_unloaded "${service}"; then
+        LAUNCHCTL_ERROR="launchctl bootout did not finish for ${service} within 30 seconds"
+        return 1
+      fi
     elif service_is_loaded "${service}"; then
-      die "launchctl bootout failed for ${service}: ${launch_error}"
+      LAUNCHCTL_ERROR="launchctl bootout failed for ${service}: ${launch_error}"
+      return 1
     fi
   fi
 }
@@ -1097,13 +1191,15 @@ bootstrap_service() {
   domain="$(launch_domain 2>/dev/null || true)"
   plist="$(plist_path "${service}")"
   if [[ "${APPLY}" -eq 0 ]]; then
+    bootout_service "${service}" || die "${LAUNCHCTL_ERROR}"
+    set_service_launchd_enabled "${service}" 1 || die "${LAUNCHCTL_ERROR}"
     quote_cmd launchctl bootstrap "gui/$(id -u)" "${plist}"
     return 0
   fi
   [[ -n "${domain}" ]] || die "no launchd user domain; log in as $(id -un) and rerun"
   [[ -f "${plist}" ]] || die "missing installed plist: ${plist}"
-  bootout_service "${service}"
-  launchctl enable "${domain}/$(service_label "${service}")" >/dev/null 2>&1 || true
+  bootout_service "${service}" || die "${LAUNCHCTL_ERROR}"
+  set_service_launchd_enabled "${service}" 1 || die "${LAUNCHCTL_ERROR}"
   for attempt in 1 2 3 4 5; do
     if launch_error="$(launchctl bootstrap "${domain}" "${plist}" 2>&1)"; then
       # launchctl can acknowledge bootstrap before an earlier asynchronous
@@ -1388,26 +1484,68 @@ service_enabled() {
   is_true "${setting}"
 }
 
+service_should_be_active() {
+  local service="$1"
+  local check_keychain="${2:-1}"
+  service_enabled "${service}" || return 1
+  if [[ "${service}" == "notifier" && "${check_keychain}" -eq 1 ]] &&
+      ! keychain_has_slack; then
+    return 1
+  fi
+}
+
+service_disable_reason() {
+  local service="$1"
+  local check_keychain="${2:-1}"
+  if ! service_enabled "${service}"; then
+    printf '%s' config-disabled
+  elif [[ "${service}" == "notifier" && "${check_keychain}" -eq 1 ]] &&
+      ! keychain_has_slack; then
+    printf '%s' missing-keychain
+  else
+    return 1
+  fi
+}
+
 load_configured_services() {
   local service
+  local disable_reason
+  local reconciliation_errors=""
+  local -a services_to_start=()
+
+  # Reconcile every service that must remain down before bootstrapping any
+  # enabled service. A failure to start an earlier service must never leave a
+  # later configured-disabled job loaded or eligible for login-time loading.
+  for service in "${SERVICES[@]}"; do
+    disable_reason=""
+    if ! service_should_be_active "${service}" "${APPLY}"; then
+      disable_reason="$(service_disable_reason "${service}" "${APPLY}")"
+      if ! stop_service "${service}"; then
+        if [[ -n "${reconciliation_errors}" ]]; then
+          reconciliation_errors+="; "
+        fi
+        reconciliation_errors+="${LAUNCHCTL_ERROR}"
+      fi
+      if [[ "${disable_reason}" == "missing-keychain" ]]; then
+        warn "Slack Keychain item is missing; notifier was not started"
+      fi
+    else
+      services_to_start[${#services_to_start[@]}]="${service}"
+    fi
+  done
+  if [[ -n "${reconciliation_errors}" ]]; then
+    die "failed to reconcile disabled launchd services: ${reconciliation_errors}"
+  fi
+
   if [[ "${APPLY}" -eq 1 ]] && ! cli_has_shadow_commands; then
     warn "shadow CLI commands are not installed; plists were installed but services were not started"
     warn "run ./scripts/mac-studio update --apply after installing the shadow runtime"
     return 0
   fi
 
-  for service in shadow paper web external-watchdog backup retention; do
+  for service in "${services_to_start[@]}"; do
     start_one "${service}"
   done
-
-  if service_enabled notifier; then
-    if keychain_has_slack || [[ "${APPLY}" -eq 0 ]]; then
-      bootstrap_service notifier
-    else
-      warn "Slack Keychain item is missing; notifier was installed but not started"
-      warn "run ./scripts/mac-studio slack set --apply, then restart --apply"
-    fi
-  fi
 }
 
 install_all() {
@@ -1419,6 +1557,10 @@ install_all() {
         "${SHADOW_MODE_OVERRIDE}" == "diagnostic" &&
         "${START_SERVICES}" -eq 1 ]]; then
     die "a new named diagnostic instance must be installed with --no-start and started only after review"
+  fi
+  if [[ "${START_SERVICES}" -eq 0 ]]; then
+    note "Disabling and unloading services because --no-start was selected"
+    stop_all_services
   fi
   ensure_python "${allow_brew}"
   create_layout
@@ -1442,8 +1584,6 @@ install_all() {
   render_all_plists
   if [[ "${START_SERVICES}" -eq 1 ]]; then
     load_configured_services
-  else
-    note "Services were not loaded because --no-start was selected"
   fi
   if [[ "${APPLY}" -eq 1 ]]; then
     note "Installation completed. Data and configuration were preserved."
@@ -1470,9 +1610,7 @@ uninstall_services() {
   local service
   require_macos_for_apply
   note "Unloading known Coinpilot LaunchAgents"
-  for service in "${SERVICES[@]}"; do
-    bootout_service "${service}"
-  done
+  stop_all_services
 
   note "Removing only installed helpers and LaunchAgent definitions"
   for service in "${SERVICES[@]}"; do
@@ -1500,24 +1638,17 @@ validate_service_name() {
   esac
 }
 
-for_each_service() {
-  local action="$1"
-  local requested="$2"
-  local service
-  validate_service_name "${requested}"
-  if [[ "${requested}" == "all" ]]; then
-    for service in "${SERVICES[@]}"; do
-      "${action}" "${service}"
-    done
-  else
-    "${action}" "${requested}"
-  fi
-}
-
 start_one() {
   local service="$1"
-  if ! service_enabled "${service}"; then
-    note "Skipping disabled service: ${service}"
+  local disable_reason=""
+  if ! service_should_be_active "${service}" "${APPLY}"; then
+    disable_reason="$(service_disable_reason "${service}" "${APPLY}")"
+    stop_one "${service}"
+    if [[ "${disable_reason}" == "missing-keychain" ]]; then
+      warn "Slack Keychain item is missing; ${service} was not started"
+    else
+      note "Skipping disabled service: ${service}"
+    fi
     return 0
   fi
   case "${service}" in
@@ -1526,18 +1657,49 @@ start_one() {
         die "paper config failed isolation or schema validation"
       fi
       ;;
-    notifier)
-      if [[ "${APPLY}" -eq 1 ]] && ! keychain_has_slack; then
-        warn "Slack Keychain item is missing; ${service} was not started"
-        return 0
-      fi
-      ;;
   esac
   bootstrap_service "${service}"
 }
 
 stop_one() {
-  bootout_service "$1"
+  local service="$1"
+  if ! stop_service "${service}"; then
+    die "failed to stop ${service}: ${LAUNCHCTL_ERROR}"
+  fi
+}
+
+stop_all_services() {
+  local service
+  local errors=""
+  for service in "${SERVICES[@]}"; do
+    if ! stop_service "${service}"; then
+      if [[ -n "${errors}" ]]; then
+        errors+="; "
+      fi
+      errors+="${LAUNCHCTL_ERROR}"
+    fi
+  done
+  if [[ -n "${errors}" ]]; then
+    die "failed to stop launchd services: ${errors}"
+  fi
+}
+
+stop_service() {
+  local service="$1"
+  local errors=""
+  local operation_error=""
+  if ! set_service_launchd_enabled "${service}" 0; then
+    errors="${LAUNCHCTL_ERROR}"
+  fi
+  if ! bootout_service "${service}"; then
+    operation_error="${LAUNCHCTL_ERROR}"
+    if [[ -n "${errors}" ]]; then
+      errors+="; "
+    fi
+    errors+="${operation_error}"
+  fi
+  LAUNCHCTL_ERROR="${errors}"
+  [[ -z "${errors}" ]]
 }
 
 restart_one() {
@@ -1556,23 +1718,44 @@ restart_one() {
 show_status() {
   local service
   local domain
+  local disable_reason
+  local override_state
   local web_host
   local web_port
   local dashboard_state
   local paper_summary
   domain="$(launch_domain 2>/dev/null || true)"
+  refresh_launchd_disabled_overrides "${domain}"
   printf 'instance: %s\n' "${INSTANCE}"
   printf 'app_home: %s\n' "${APP_HOME}"
   printf 'launch_domain: %s\n' "${domain:-unavailable}"
   for service in "${SERVICES[@]}"; do
+    disable_reason="$(service_disable_reason "${service}" 1 2>/dev/null || true)"
+    override_state="$(service_launchd_override_state "${service}")"
     if service_is_loaded "${service}"; then
-      if [[ "${service}" == "paper" ]] && ! service_is_running paper; then
+      if [[ -n "${disable_reason}" ]]; then
+        if [[ "${override_state}" == "disabled" ]]; then
+          printf '%-20s loaded-%s\n' "${service}" "${disable_reason}"
+        else
+          printf '%-20s loaded-%s-override-%s\n' \
+            "${service}" "${disable_reason}" "${override_state}"
+        fi
+      elif [[ "${override_state}" == "disabled" ]]; then
+        printf '%-20s loaded-override-disabled\n' "${service}"
+      elif [[ "${service}" == "paper" ]] && ! service_is_running paper; then
         printf '%-20s loaded-not-running\n' "${service}"
       else
         printf '%-20s loaded\n' "${service}"
       fi
     else
-      printf '%-20s not-loaded\n' "${service}"
+      if [[ -n "${disable_reason}" && "${override_state}" != "disabled" ]]; then
+        printf '%-20s not-loaded-%s-override-%s\n' \
+          "${service}" "${disable_reason}" "${override_state}"
+      elif [[ -z "${disable_reason}" && "${override_state}" == "disabled" ]]; then
+        printf '%-20s not-loaded-override-disabled\n' "${service}"
+      else
+        printf '%-20s not-loaded\n' "${service}"
+      fi
     fi
   done
   web_host="$(runtime_value COINPILOT_WEB_HOST 127.0.0.1)"
@@ -1610,6 +1793,9 @@ doctor() {
   local free_pct
   local probe_output
   local probe_status
+  local domain
+  local disable_reason
+  local override_state
 
   doctor_ok() { printf 'OK    %s\n' "$*"; }
   doctor_warn() { printf 'WARN  %s\n' "$*"; warnings=$((warnings + 1)); }
@@ -1721,7 +1907,25 @@ doctor() {
     doctor_fail "dashboard host must be 127.0.0.1, found ${host}"
   fi
 
+  domain="$(launch_domain 2>/dev/null || true)"
+  refresh_launchd_disabled_overrides "${domain}"
   for service in "${SERVICES[@]}"; do
+    disable_reason="$(service_disable_reason "${service}" 1 2>/dev/null || true)"
+    override_state="$(service_launchd_override_state "${service}")"
+    if [[ -n "${disable_reason}" ]]; then
+      if service_is_loaded "${service}"; then
+        doctor_fail "launchd loaded despite ${disable_reason}: ${service}"
+      fi
+      if [[ "${override_state}" == "disabled" ]]; then
+        doctor_ok "launchd explicitly disabled: ${service} (reason=${disable_reason})"
+      else
+        doctor_fail "launchd disable override drift: ${service} (reason=${disable_reason}, override=${override_state})"
+      fi
+      continue
+    fi
+    if [[ "${override_state}" == "disabled" ]]; then
+      doctor_fail "launchd disabled despite active configuration: ${service}"
+    fi
     if service_is_loaded "${service}"; then
       if [[ "${service}" == "paper" ]] && ! service_is_running paper; then
         doctor_fail "launchd loaded but not running: paper"
@@ -1816,11 +2020,11 @@ slack_action() {
         "${helper}" "${action}" --account "${KEYCHAIN_ACCOUNT}" \
           --service "${KEYCHAIN_SERVICE}"
         if [[ "${action}" == "set" && -f "$(plist_path notifier)" ]]; then
-          note "Reloading Slack notifier"
-          bootstrap_service notifier
+          note "Reconciling Slack notifier"
+          start_one notifier
         elif [[ "${action}" == "delete" ]]; then
           note "Stopping Slack notifier so the removed secret is not retained"
-          bootout_service notifier
+          stop_one notifier
         fi
       fi
       ;;
@@ -1868,18 +2072,36 @@ case "${COMMAND}" in
   start)
     require_macos_for_apply
     guard_named_instance_start
-    for_each_service start_one "${POSITIONAL[0]:-all}"
+    requested_service="${POSITIONAL[0]:-all}"
+    validate_service_name "${requested_service}"
+    if [[ "${requested_service}" == "all" ]]; then
+      load_configured_services
+    else
+      start_one "${requested_service}"
+    fi
     if [[ "${APPLY}" -eq 0 ]]; then note "Dry-run only. Rerun with --apply."; fi
     ;;
   stop)
     require_macos_for_apply
-    for_each_service stop_one "${POSITIONAL[0]:-all}"
+    requested_service="${POSITIONAL[0]:-all}"
+    validate_service_name "${requested_service}"
+    if [[ "${requested_service}" == "all" ]]; then
+      stop_all_services
+    else
+      stop_one "${requested_service}"
+    fi
     if [[ "${APPLY}" -eq 0 ]]; then note "Dry-run only. Rerun with --apply."; fi
     ;;
   restart)
     require_macos_for_apply
     guard_named_instance_start
-    for_each_service restart_one "${POSITIONAL[0]:-all}"
+    requested_service="${POSITIONAL[0]:-all}"
+    validate_service_name "${requested_service}"
+    if [[ "${requested_service}" == "all" ]]; then
+      load_configured_services
+    else
+      restart_one "${requested_service}"
+    fi
     if [[ "${APPLY}" -eq 0 ]]; then note "Dry-run only. Rerun with --apply."; fi
     ;;
   logs)

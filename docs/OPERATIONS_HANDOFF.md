@@ -1,6 +1,6 @@
 # CoinPilot operations handoff
 
-> 마지막 갱신: 2026-07-22 22:41 KST
+> 마지막 갱신: 2026-07-23 00:38 KST
 > 이 문서는 시점 스냅샷이다. 손익, PID, revision, readiness 같은 동적 값은
 > 반드시 다시 조회하며 현재 관측 결과가 이 문서보다 우선한다.
 
@@ -20,20 +20,55 @@
 분리하고 dashboard는 `Live · warming up`, stale, halted, stopped를 구분한다.
 `/health/ready`의 running+fresh fail-closed 계약은 바뀌지 않았다.
 
+## 2026-07-22 재부팅 후 LaunchAgent drift
+
+22:50 KST의 정상 shutdown/reboot 뒤, 설정상 비활성인 plist 일부가 로그인 시
+`RunAtLoad`로 다시 로드됐다. 당시 `stop`과 비활성 install은 job을 bootout만 하고
+launchd에 영구 `disable`하지 않았던 것이 원인이었다. 23:57 최초 재점검에서
+승인되지 않은 38개 loaded job을 확인했다.
+
+- D2: notifier 4개 running, paper 4개 EX_CONFIG 재시작 루프
+- C2: shadow/web/external-watchdog 12개 running, notifier 4개 loaded/running
+- legacy: shadow 4개 running, backup/retention 8개 loaded, XRP/SOL paper 2개 loaded
+
+영향은 모두 모의거래 경계 안에 있었다. 전 원장과 API에서
+`simulated=true`, `live_order_routing=false`, `orders_sent=0`이었고 실제 주문은
+없었다. 다만 비활성 notifier가 D2와 C2 shadow에서 시장별 2건씩, 총 16개의
+시간 요약을 Slack에 전달했다. 첫 8건은 로그인 뒤 22:54:25~54, 다음 8건은
+23:00:15~17 KST였으며 00:00 이후 추가 전달은 없다.
+
+C2의 비의도 shadow는 observe여서 결정·주문·체결이 모두 0이었다. retired 1%
+diagnostic은 BTC가 기존 daily-loss halt를 그대로 보존해 결정 0, ETH/XRP/SOL은
+각각 50/14/55건의 모의 체결과 -₩4,448.05/-₩1,343.82/-₩6,248.06의 이번-run
+손실을 기록했다. 네 legacy 원장은 모두 flat, pending 0으로 정상 종료됐고 DB,
+WAL/SHM, archive, log는 삭제하거나 초기화하지 않고 그대로 보존했다.
+
+23:59~00:00 KST에 승인되지 않은 job을 bootout하고 launchd persistent override를
+명시적으로 disabled 처리했다. 현재 승인 matrix는 D2의
+shadow/web/external-watchdog/backup/retention, C2의 paper/backup/retention뿐이며
+legacy 전 역할도 disabled다. 재발 방지 소스는 stop/no-start/설정상 비활성
+서비스를 persistent disable한 뒤 bootout하고, start만 다시 enable하도록 한다.
+Status와 Doctor는 설정과 loaded/override 상태의 drift를 명시적으로 표시한다.
+
+이 수정은 저장소의 운영 entrypoint와 테스트만 바꾸며 설치된 D2 helper/package나
+config fingerprint는 바꾸지 않는다. 따라서 현재 D2를 install/redeploy하거나 새
+원장으로 전환하지 않았다. 다음 계획된 로그인/재부팅 뒤 persistent disable이
+유지되는지는 다시 실측한다. 이 검증만을 위해 운영 호스트를 재부팅하지 않는다.
+
 ## 현재 운영 토폴로지
 
 ### D2 bounded diagnostic shadow
 
-관측 시각 2026-07-22 22:41 KST에 네 인스턴스 모두 `ready`, warmup 100,
+관측 시각 2026-07-23 00:03 KST에 네 인스턴스 모두 `ready`, warmup 100,
 fresh feed, flat position, pending 0이었다. shadow/web/external-watchdog/backup/
 retention LaunchAgent가 로드되어 있고 각 doctor는 `0 errors, 0 warnings`였다.
 
-| instance | market | dashboard | 관측 체결 | 관측 실현손익 |
+| instance | market | dashboard | current/lineage 체결 | current-run 실현손익 |
 | --- | --- | --- | ---: | ---: |
-| `d2-btc` | KRW-BTC | `http://127.0.0.1:8774` | 6 | -₩94.95 |
-| `d2-eth` | KRW-ETH | `http://127.0.0.1:8775` | 6 | -₩83.85 |
-| `d2-xrp` | KRW-XRP | `http://127.0.0.1:8776` | 2 | -₩40.06 |
-| `d2-sol` | KRW-SOL | `http://127.0.0.1:8777` | 6 | -₩141.20 |
+| `d2-btc` | KRW-BTC | `http://127.0.0.1:8774` | 2 / 8 | -₩121.25 |
+| `d2-eth` | KRW-ETH | `http://127.0.0.1:8775` | 2 / 8 | -₩108.85 |
+| `d2-xrp` | KRW-XRP | `http://127.0.0.1:8776` | 2 / 4 | -₩80.09 |
+| `d2-sol` | KRW-SOL | `http://127.0.0.1:8777` | 2 / 8 | -₩166.20 |
 
 활성 원장은 각 instance의 다음 파일이다.
 
@@ -47,6 +82,12 @@ retention LaunchAgent가 로드되어 있고 각 doctor는 `0 errors, 0 warnings
 drawdown 10%, 진입 cooldown 1시간, 일 최대 24 round trips이다. 이 전략은
 validated alpha가 아니므로 소액 손실과 수수료 발생 자체는 장애가 아니다.
 
+재부팅 전 run은 22:50:37 KST에 모두 `graceful:sigterm`, flat, pending 0으로
+종료됐다. 현재 run은 22:54:31에 같은 config/code fingerprint와 `restart_of`로
+연결돼 각 원장의 run lineage가 2개다. 현재 run 중 확정된 `receive_error`
+reconnect 경계가 BTC/ETH/XRP/SOL 각각 2/3/2/1회 있었지만 같은 PID와 run에서
+warmup을 다시 충족했고 최신 상태는 fresh/ready다.
+
 배포 직후 55초 연속 관찰에서 네 run ID가 유지되고 warmup은 100 아래로
 떨어지지 않았다. 같은 구간에 BTC 2건, SOL 4건의 `receive_interval` marker가
 실제로 있었지만 두 instance 모두 ready를 유지했다. connection은 각 1개,
@@ -54,15 +95,16 @@ monotonic regression은 0이었다.
 
 ### C2 60분봉 forward-paper
 
-관측 시각에 네 paper LaunchAgent는 모두 실행 중이고 `halt_state=ACTIVE`,
+관측 시각 2026-07-23 00:08 KST에 네 paper LaunchAgent는 모두 실행 중이고
+`halt_state=ACTIVE`,
 `updated_at`과 revision이 증가하고 있었다.
 
 | instance | market | 관측 revision | 관측 실현손익 |
 | --- | --- | ---: | ---: |
-| `c2-btc` | KRW-BTC | 5197 | -₩14,583.35 |
-| `c2-eth` | KRW-ETH | 3202 | ₩0 |
-| `c2-xrp` | KRW-XRP | 3206 | ₩0 |
-| `c2-sol` | KRW-SOL | 3144 | ₩0 |
+| `c2-btc` | KRW-BTC | 5335 | -₩14,583.35 |
+| `c2-eth` | KRW-ETH | 3340 | ₩0 |
+| `c2-xrp` | KRW-XRP | 3344 | ₩0 |
+| `c2-sol` | KRW-SOL | 3277 | ₩0 |
 
 각 원장은 `data/coinpilot-c2.db`다. C2는 시간봉 전략이므로 PnL이 오래
 고정되거나 체결이 없는 것만으로 중단이라고 판단하지 않는다.
@@ -79,12 +121,13 @@ manifest의 자체 검증은 일치하고 런타임은 ACTIVE이므로 현재 �
 - D2/C2 모두 공개 시세 기반 모의거래다.
 - `simulated=true`, `live_order_routing=false`, `orders_sent=0`을 확인했다.
 - Upbit private API key와 실제 주문 경로는 없다.
-- D2/C2 notifier는 not-loaded이며 D2 runtime의
-  `COINPILOT_ENABLE_NOTIFIER=0`을 유지한다.
+- D2/C2 notifier는 not-loaded이고 launchd persistent disabled이며 D2/C2
+  runtime의 `COINPILOT_ENABLE_NOTIFIER=0`을 유지한다.
 - 과거 1% diagnostic instance `btc/eth/xrp/sol`과 port
   `8766/8767/8772/8773`은 retired 상태이며 listener가 없다. 일부 runtime
-  enable 값이나 launchd enable 상태는 남아 있을 수 있으므로 이 legacy
-  instance를 대상으로 `start`, `install`, `bootstrap`을 실행하지 않는다.
+  enable 값과 plist는 감사용으로 남아 있지만 모든 legacy launchd override는
+  disabled다. 이 instance를 대상으로 `start`, `install`, `bootstrap`을
+  실행하지 않는다.
 - `127.0.0.1:8765`는 다른 로컬 프로젝트 소유이므로 건드리지 않는다.
 
 ## 검증 증거
@@ -94,8 +137,14 @@ manifest의 자체 검증은 일치하고 런타임은 ACTIVE이므로 현재 �
 - `ab784db` 당시 `git diff --check` 성공
 - commit `ab784db` GitHub Actions: Ubuntu/macOS 4개 check 모두 성공
 - D2 네 doctor: 각각 `0 errors, 0 warnings`
+- C2 네 doctor: 알려진 repository-source manifest drift 각 1건, 추가 오류 0,
+  warning 0; installed package `verify-installed valid=true`
+- 2026-07-23 현재 로컬 Python: `306 passed`
+- launchd persistent disable 회귀를 포함한 `./scripts/mac-studio test` 성공
 - 배포 전 기존 D2 네 원장 SQLite integrity check와 backup checksum 성공
 - 배포 후 신규 D2 네 원장 SQLite integrity check 성공, run lineage 각 1개
+- 재부팅 후 D2/C2/legacy 관련 DB SQLite integrity check 성공; 현재 D2 run
+  lineage 각 2개
 
 관련 변경 이력:
 
@@ -119,6 +168,8 @@ for i in c2-btc c2-eth c2-xrp c2-sol; do
   ./scripts/mac-studio status --instance "$i"
   ./scripts/mac-studio doctor --instance "$i"
 done
+
+launchctl print-disabled "gui/$(id -u)" | rg 'dev\.coinpilot'
 
 for port in 8774 8775 8776 8777; do
   curl -fsS "http://127.0.0.1:${port}/api/status"
@@ -148,9 +199,9 @@ done
 ```
 
 현재 미해결 운영 과제는 C2 doctor가 repository source drift와 설치본 runtime
-건전성을 한 오류로 표시하는 점이다. 향후 개선 시 immutable 검증을 약화하거나
-기존 C2 계좌를 덮어쓰지 말고, 두 상태를 명확히 분리해 표시하는 방향으로
-검토한다.
+건전성을 한 오류로 표시하는 점과, 다음 계획된 로그인/재부팅 뒤 launchd
+persistent disable을 다시 실측하는 것이다. 향후 C2 개선 시 immutable 검증을
+약화하거나 기존 C2 계좌를 덮어쓰지 말고 두 상태를 명확히 분리해 표시한다.
 
 ## 다음 세션용 복사 프롬프트
 
@@ -159,7 +210,7 @@ done
 
 먼저 ~/.codex/AGENTS.md, 저장소의 AGENTS.md,
 docs/OPERATIONS_HANDOFF.md, docs/MAC_STUDIO.md, SECURITY.md를 읽어.
-handoff는 2026-07-22 시점 스냅샷이므로 그대로 믿지 말고 git 상태와 실제
+handoff는 2026-07-23 시점 스냅샷이므로 그대로 믿지 말고 git 상태와 실제
 LaunchAgent/API/SQLite 상태를 다시 조회해. 현재 관측 결과가 문서보다 우선이야.
 
 반드시 지킬 것:
@@ -174,6 +225,8 @@ LaunchAgent/API/SQLite 상태를 다시 조회해. 현재 관측 결과가 문�
 - C2 현재 계정에 install/update를 적용하지 말 것. repo source drift와 실제
   installed runtime 건강 상태를 구분할 것.
 - 사용자가 명시하지 않으면 Slack notifier를 켜지 말 것.
+- 설정상 비활성인 LaunchAgent는 not-loaded뿐 아니라 launchctl persistent
+  disabled인지도 확인할 것. loaded/override drift는 즉시 fail-closed할 것.
 
 D2 d2-btc/d2-eth/d2-xrp/d2-sol의 status와 doctor, 8774~8777 /api/status를
 확인하고, C2 c2-btc/c2-eth/c2-xrp/c2-sol의 status와 doctor,

@@ -264,13 +264,13 @@ INSTALL_MANIFEST="${INSTALLED_HOME}/state/installed-helper.json"
 [[ -x "${INSTALLED_HELPER}" ]]
 [[ -f "${INSTALL_MANIFEST}" ]]
 [[ -f "${INSTALLED_PLIST}" ]]
-[[ "$(stat -f '%Lp' "${INSTALLED_HELPER}" 2>/dev/null || stat -c '%a' "${INSTALLED_HELPER}")" == "755" ]]
 python3 - "${INSTALLED_HELPER}" "${INSTALL_MANIFEST}" "${INSTALLED_PLIST}" \
   "${PYTHON_WRAPPER}" "${APPLY_HOME}" <<'PY'
 import hashlib
 import json
 import pathlib
 import plistlib
+import stat
 import sys
 
 helper = pathlib.Path(sys.argv[1])
@@ -278,6 +278,8 @@ manifest = json.loads(pathlib.Path(sys.argv[2]).read_text())
 plist_path = pathlib.Path(sys.argv[3])
 python_executable = sys.argv[4]
 home = pathlib.Path(sys.argv[5])
+if stat.S_IMODE(helper.stat().st_mode) != 0o755:
+    raise SystemExit("installed helper mode mismatch")
 if manifest.get("schema_version") != 2:
     raise SystemExit("installed bundle manifest schema mismatch")
 if manifest["helper"] != {

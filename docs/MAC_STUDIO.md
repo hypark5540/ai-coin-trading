@@ -31,6 +31,8 @@ Upbit 키는 사용하지 않는다.
 - `external-watchdog`: 60초마다 실행되는 별도 watchdog 프로세스
 - `backup`: 매일 03:15 SQLite online backup과 integrity check
 - `retention`: 매일 04:15 원본·백업·회전 로그의 제한적 보존 처리
+- `daily-scorecard`: 승인된 D2/C2 8개 원장의 전일 KST 성적표를 매일 00:10
+  Slack으로 보내는 별도 중앙 one-shot job
 
 `paper`는 기존 `shadow`와 설정 및 SQLite 원장을 공유하지 않는다. 설치는 되지만
 `COINPILOT_ENABLE_PAPER=0`이 기본값이므로 설정을 생성하고 검토하기 전에는
@@ -41,6 +43,11 @@ Mac에서 실행된다. Mac의 전원이나 인터넷이 완전히 끊기면 Sla
 없다. 진정한 외부 dead-man 감시는 별도 서버나 SaaS가 이 Mac의 heartbeat
 부재를 확인하도록 추가해야 한다. 공급자를 정하기 전까지 이 부분은 의도적으로
 placeholder다.
+
+`daily-scorecard`는 per-instance 7개 서비스와 별도다. 거래 instance의 venv,
+config, package, fingerprint, DB 또는 outbox를 변경하지 않고 SQLite
+`mode=ro` + `query_only`로만 읽는다. 전송 원장과 JSON/Markdown 감사 산출물은
+`~/Library/Application Support/Coinpilot/reporting` 아래에 owner-only로 보존한다.
 
 ## 최초 설치
 
@@ -359,6 +366,100 @@ deterministic key로 정상 재시작과 동시 실행 때 같은 요약이 중�
 이 정책은 즉시 critical Slack도 시간 요약으로 지연한다. 실제 주문 경로가 없는
 shadow 전용 운용을 전제로 한 저소음 설정이다. 외부 dead-man 감시가 필요하면
 별도 서버/SaaS에서 구성해야 한다.
+
+위 시간별 notifier는 D2 shadow DB의 outbox를 변경하고 C2를 읽지 못하므로 통합
+일일 보고에 사용하지 않는다. D2/C2의 `COINPILOT_ENABLE_NOTIFIER=0`과 persistent
+disabled override를 그대로 유지한다.
+
+### D2 + C2 통합 일일 성적표
+
+중앙 리포터는 다음 8개만 명시 allowlist한다.
+
+```text
+D2: d2-btc, d2-eth, d2-xrp, d2-sol
+C2: c2-btc, c2-eth, c2-xrp, c2-sol
+```
+
+DB를 glob하지 않으므로 legacy `btc/eth/xrp/sol`, 과거 `shadow.db`, C2의 비활성
+shadow DB가 섞이지 않는다. D2는 각 `config.toml`의 활성 versioned
+`shadow.database_path`, C2는 각 `paper.toml`의 고정
+`data.database_path=.../coinpilot-c2.db`만 읽는다.
+
+설치는 먼저 dry-run으로 중앙 label만 조작하는지 확인한다.
+
+```bash
+./scripts/mac-studio-daily-scorecard install
+./scripts/mac-studio-daily-scorecard install --apply
+./scripts/mac-studio-daily-scorecard doctor
+./scripts/mac-studio-daily-scorecard status
+```
+
+정상 deadline은 매일 `00:10 KST`다. LaunchAgent는 로그인·재부팅 catch-up과 Slack
+실패 backoff를 위해 매시 `:10`에 짧게 실행되지만 deterministic
+`daily-scorecard:v1:<KST date>` key와 별도 delivery receipt 때문에 하루 정상
+메시지는 한 건만 보낸다. Slack POST 성공 직후 local delivered 기록 전에 전원이
+끊기면 원격·로컬 원자 commit이 불가능해 드물게 중복될 수 있는 at-least-once
+경계는 남는다.
+
+새로운 완료일은 먼저 보내고, 그 다음 실행부터 최초 source 일자까지의 미전송
+backlog 또는 retry 가능한 receipt 중 하루만 처리한다. 따라서 여러 날 offline이어도
+날짜를 영구 건너뛰지 않고, 한 번에 메시지를 몰아 보내지도 않는다. 수동 확인은
+기본적으로 preview만 한다. `--apply`도 같은 latest-first/one-day catch-up selector를
+사용하며 이미 delivered인 report ID는 다시 보내지 않는다. 미래 또는 아직 deadline이
+되지 않은 날짜는 freeze·전송하지 않는다.
+
+```bash
+./scripts/mac-studio-daily-scorecard run
+./scripts/mac-studio-daily-scorecard run --apply
+```
+
+성적표 지표 계약은 다음과 같다.
+
+- 공통: KST 전일 고정 반개구간 `[00:00, 24:00)`. 각 sell의 배분원가와 수수료를
+  sell 시각에 인식한 **회계 실현손익**과, position이 flat으로 돌아온 최종 sell
+  시각에 귀속한 **완료 round-trip P&L/승률/보유시간**을 구분한다. 일/전일/최근
+  7일/lineage 체결·수수료·회전대금도 함께 보낸다.
+- D2: 자정 `<= start`의 마지막 causal equity anchor와 `< end` sample로 계산한
+  일 변화·수익률·DD, 경계 sample lag와 partial 여부, 최신 restart lineage의
+  branch/cycle 검증, run/reconnect/halt/continuity, pending·freshness·10% fail-closed
+  상태, current config·설치 code fingerprint 및 cash/position/average-cost 검산
+- C2: fill replay로 검산한 실현손익, current cash/position, ACTIVE/revision/
+  updated_at, frozen config fingerprint와 설치 package manifest. 보존된 과거 account는
+  현재 manifest account 집계에서 제외하되 삭제하지 않는다.
+- 안전: 모든 source의 `simulated=true`, `own_execution=false`, `live_order_routing=false`,
+  `orders_sent=0`; legacy health/manifest에 앞의 두 필드가 없으면 검증된 immutable
+  installed simulation-only/public-only runtime identity로만 증명하며, 명시된 값이
+  모순되거나 어느 증거든 불명확하면 PASS로 표시하지 않음
+
+C2는 current state 한 행과 fill event만 저장해 과거 equity history가 없다. 따라서
+boundary가 flat이면 cash가 정확한 equity이고, non-flat이면 최근 완료 60분봉
+close에 수수료·고정 slippage를 적용한 liquidation **추정치**로만 표시한다. C2의
+과거 일중 최대 DD는 `N/A`이며 추정치를 실제 boundary NAV로 부르지 않는다. mark가
+boundary에서 2개 interval보다 오래되면 stale로 보고 equity/return을 `N/A` 처리한다.
+
+8개 source 중 하나라도 일시적으로 읽히지 않거나 fingerprint/reconciliation이
+불명확하면 불완전한 정상 성적표를 freeze하거나 delivered 처리하지 않는다. 대신
+별도 품질 경고를 최대 6시간에 한 번 보내고, 매시 다시 원본에서 계산한다. 정상화된
+뒤에만 해당 날짜의 immutable JSON/Markdown/checksum과 delivery receipt를 만든다.
+JSON이 기록된 직후 중단된 경우에는 그 JSON을 source of truth로 검증해 빠진 Markdown과
+checksum만 복구한다.
+
+자가개선 gate는 데이터 품질, 표본수, 일/7일/lineage 관측을 정리하고 다음
+오프라인 검증을 제안할 뿐이다. 30일 T0 관측 전에는 수익 결론을 내리지 않는다.
+30일 뒤에도 C2 완료 round-trip 30건 미만이면 표본 부족으로 유지한다. 그 뒤에도
+causal replay, purged walk-forward, 2배 비용 stress와 운영자 검토를
+거친 새 model/account/ledger 후보만 만들 수 있다. 활성 전략·설정·halt·원장을
+자동 변경하거나 rearm하지 않는다.
+
+중앙 reporter를 중지하거나 제거해도 결과는 삭제하지 않는다.
+
+```bash
+./scripts/mac-studio-daily-scorecard stop --apply
+./scripts/mac-studio-daily-scorecard uninstall --apply
+```
+
+`uninstall`은 helper, self-manifest, plist만 지우고 report JSON/Markdown, delivery
+receipt와 로그는 보존한다.
 
 설정을 변경했다면 실행 중 프로세스에 임의 반영하지 말고 다음 순서를 사용한다.
 

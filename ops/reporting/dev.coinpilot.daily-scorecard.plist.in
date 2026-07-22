@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>@@LABEL@@</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@@PYTHON_EXECUTABLE@@</string>
+    <string>@@REPORTER_EXECUTABLE@@</string>
+    <string>--root</string><string>@@COINPILOT_ROOT@@</string>
+    <string>--state-dir</string><string>@@STATE_DIR@@</string>
+    <string>--artifact-dir</string><string>@@ARTIFACT_DIR@@</string>
+    <string>--keychain-service</string><string>@@KEYCHAIN_SERVICE@@</string>
+    <string>--keychain-account</string><string>@@KEYCHAIN_ACCOUNT@@</string>
+    <string>--schedule-hour</string><string>0</string>
+    <string>--schedule-minute</string><string>10</string>
+  </array>
+  <key>WorkingDirectory</key><string>@@REPORT_HOME@@</string>
+  <key>RunAtLoad</key><true/>
+  <!-- Run at :10 each hour for catch-up/backoff. Delivery is deduplicated to
+       the one report whose normal deadline is 00:10 KST. -->
+  <key>StartCalendarInterval</key>
+  <dict><key>Minute</key><integer>10</integer></dict>
+  <key>ThrottleInterval</key><integer>60</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>Nice</key><integer>10</integer>
+  <key>LowPriorityIO</key><true/>
+  <key>Umask</key><integer>63</integer>
+  <key>StandardOutPath</key><string>@@LOG_DIR@@/daily-scorecard.stdout.log</string>
+  <key>StandardErrorPath</key><string>@@LOG_DIR@@/daily-scorecard.stderr.log</string>
+</dict>
+</plist>

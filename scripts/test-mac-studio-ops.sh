@@ -13,10 +13,12 @@ trap cleanup EXIT INT TERM
 
 SHELL_FILES=(
   "${REPO_ROOT}/scripts/mac-studio"
+  "${REPO_ROOT}/scripts/mac-studio-daily-scorecard"
   "${REPO_ROOT}/scripts/coinpilot-service.sh"
   "${REPO_ROOT}/scripts/mac-studio-keychain"
   "${REPO_ROOT}/scripts/mac-studio-backup"
   "${REPO_ROOT}/scripts/mac-studio-retention"
+  "${REPO_ROOT}/scripts/test-daily-scorecard-ops.sh"
   "${REPO_ROOT}/scripts/test-mac-studio-ops.sh"
 )
 
@@ -1565,3 +1567,5 @@ if grep -R -E '(^|[;&|])[[:space:]]*sudo[[:space:]]' \
   exit 1
 fi
 echo "OK no implicit sudo"
+
+"${REPO_ROOT}/scripts/test-daily-scorecard-ops.sh"

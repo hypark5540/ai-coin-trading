@@ -37,14 +37,20 @@
   Dashboard port는 각각 `8774`, `8775`, `8776`, `8777`이다.
 - C2 60분봉 forward-paper: `c2-btc`, `c2-eth`, `c2-xrp`, `c2-sol`.
   C2 dashboard와 shadow 서비스는 비활성이며 paper 서비스만 운용한다.
+- 통합 일일 성적표는 중앙 LaunchAgent `dev.coinpilot.daily-scorecard` 하나만
+  사용한다. 이 job은 승인된 D2/C2 8개 원장을 read-only로 조회하고 별도
+  `~/Library/Application Support/Coinpilot/reporting` 아래에만 전송 상태와
+  감사 산출물을 쓴다. 불완전 source 결과는 최종 성적표로 확정하지 않고 재시도하며,
+  여러 날 중단 뒤에도 latest-first로 하루씩 backlog를 복구한다.
 - 과거 `btc`, `eth`, `xrp`, `sol` 인스턴스와 port
   `8766`, `8767`, `8772`, `8773`은 폐기된 1% diagnostic 화면이다. 재가동하지
   않는다.
 - 이 Mac Studio의 마지막 관측에서 port `8765`는 다른 로컬 프로젝트가
   사용했다. 어떤 점유 port도 현재 listener 소유권을 먼저 검증하지 않고
   프로세스를 중단하거나 설정을 변경하지 않는다.
-- 마지막 승인 설정에서 D2/C2 Slack notifier는 비활성이다. 현재 상태를 다시
-  확인하고, 사용자의 명시적 요청 없이 켜지 않는다.
+- D2/C2 per-instance hourly Slack notifier는 계속 비활성이다. 통합 일일 성적표
+  승인은 이 notifier들을 다시 켤 권한이 아니며, 중앙 daily-scorecard 외의
+  notifier는 사용자의 별도 명시적 요청 없이 켜지 않는다.
 - `runtime.env`의 비활성 값만으로 서비스가 멈췄다고 판단하지 않는다. 로그인·
   재부팅 뒤에는 해당 LaunchAgent가 실제 `not-loaded`이고 launchd override도
   `disabled`인지 확인한다. 설정상 비활성인 job이 loaded/running이면 안전
@@ -62,6 +68,8 @@
   `feed_stale`과 구분한다. `/health/ready`는 running+fresh일 때만 200이어야 한다.
 - C2는 60분봉 전략이므로 체결과 손익이 오랫동안 변하지 않아도 정상일 수 있다.
   LaunchAgent PID, `revision`, `updated_at`, `halt_state`를 함께 확인한다.
+- 일일 성적표의 자가개선 항목은 관측·분석·오프라인 후보 제안까지만 허용한다.
+  활성 전략·설정·halt·fingerprint·원장을 자동 변경하거나 rearm하지 않는다.
 
 ## 운영과 검증
 
@@ -74,6 +82,9 @@
   `./scripts/mac-studio test`, `git diff --check`를 통과시킨다. 사용자가
   commit/push를 요청한 경우 push 뒤 Ubuntu와 macOS GitHub Actions를 확인한
   다음 배포한다.
+- 중앙 reporter만 변경·배포하는 경우 D2/C2 instance에 `install` 또는 `update`를
+  실행하지 않는다. `./scripts/mac-studio-daily-scorecard`만 사용하며 기존
+  runtime, 설치 package, fingerprint, 원장과 outbox가 바뀌지 않았는지 확인한다.
 - D2 shadow 동작·source·config·fingerprint에 영향을 주는 변경은 먼저 현재
   position이 flat이고 pending 주문이 0인지 확인한다. non-flat이면 원장을
   고아로 만들거나 강제 청산하지 말고 중단·보고한다. flat일 때만 online backup,

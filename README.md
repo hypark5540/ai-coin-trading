@@ -33,6 +33,7 @@
 - 공개 시장 체결·모의체결·내 계좌 체결 provenance의 명시적 분리
 - 동일 공개피드를 archive와 stateful shadow 원장에 fan-out하는 상시 런타임
 - 소비 전 full-sync audit WAL, 지연 후 taker 부분체결, 재시작 복구, Slack outbox
+- 개별 이벤트를 묶은 KST 고정 1시간 Block Kit Slack 요약과 중복 생성·backlog 폭주 방지
 - 전체 설정·실제 소스 fingerprint와 커널 singleton으로 안전한 재배포
 - localhost 전용 읽기 dashboard와 Mac Studio launchd 원클릭 운영 도구
 - 실제 주문을 거부하는 hard live gate
@@ -243,27 +244,83 @@ cd ai-coin-trading
 ```
 
 설치기는 owner-only 디렉터리, 잠금 의존성, venv, secret 없는 설정, 사용자
-LaunchAgent 6개, Keychain Slack, SQLite online backup과 90일 retention을
+LaunchAgent 7개(기본 비활성 C2 paper 포함), Keychain Slack, SQLite online
+backup과 90일 retention을
 멱등하게 구성합니다. Dashboard는 `http://127.0.0.1:8765`에만 열립니다.
 전체 설치·업데이트·로그·복구 절차와 Terraform 대신 이 방식을 사용한 이유는
 [`docs/MAC_STUDIO.md`](docs/MAC_STUDIO.md)에 있습니다.
 
-## 현재 동결 후보의 결과
+BTC와 ETH 공개피드를 분리된 5백만원 observe 계좌로 동시에 운영할 때는 named
+instance를 사용합니다. 각 인스턴스는 DB, archive/audit lock, backup, logs,
+복사 설치된 코드, LaunchAgent와 dashboard port를 완전히 분리합니다.
 
-현재 후보는 `KRW-BTC` 60분봉, 72시간 예상수익, 7일 추세 gate입니다.
-2026-07-19에 생성한 로컬 research assessment의
-결론은 **FAIL**입니다.
+```bash
+./scripts/mac-studio bootstrap --instance btc --market KRW-BTC \
+  --initial-cash 5000000 --order-quote 125000 \
+  --shadow-mode observe --web-port 8766 --no-start --apply
+./scripts/mac-studio bootstrap --instance eth --market KRW-ETH \
+  --initial-cash 5000000 --order-quote 125000 \
+  --shadow-mode observe --web-port 8767 --no-start --apply
+./scripts/mac-studio start all --instance btc --apply
+./scripts/mac-studio start all --instance eth --apply
+```
 
-| 구간 | 연환산 수익률 | MDD | Profit factor | 거래 |
-|---|---:|---:|---:|---:|
-| 개발 2023-07-17~2025-07-19 | +6.40% | 4.86% | 1.897 | 34 |
-| 역사적 확인 2025-07-19~2026-07-19 | -2.61% | 4.68% | 0.462 | 10 |
-| 확인구간 비용 2배 | -2.62% | 4.50% | 0.437 | 9 |
+두 계좌는 총자산을 공유하는 portfolio가 아니라 위험한도가 독립된 두 shadow
+계좌입니다. Dashboard는 BTC `127.0.0.1:8766`, ETH `127.0.0.1:8767`이며 실제
+주문 경로는 두 인스턴스 모두 비활성입니다. Slack은 체결 한 건마다 보내지 않고
+직전 완료 KST 1시간의 손익·수수료·체결·승패·잔고·운영 이벤트를 시장별 한 건으로
+요약합니다. 거래가 없는 시간에도 짧은 상태 heartbeat를 보내며, 즉시 이벤트
+알림은 비활성입니다. `diagnostic` 모드는 배관 점검용 체결 시뮬레이션일 뿐
+검증된 alpha가 아니며, Strategy Research V2 이후 운영 기본값으로 사용하지
+않습니다.
 
-동일 확인구간의 단순 보유 수익률은 약 -41.31%였으므로 하락 노출은 크게
-줄였지만, 절대수익과 20% 목표는 충족하지 못했습니다. 이 결과를 본 뒤 같은
-기간으로 파라미터를 다시 조정하면 확인구간이 오염되므로, 다음 증거는 새 기간의
-forward paper 기록으로 쌓아야 합니다.
+손실 원인 재현이 필요한 경우에는 기존 고빈도 원장을 재개하지 않고
+`d2-btc`, `d2-eth`, `d2-xrp`, `d2-sol`의 별도
+`diagnostic-bounded-v1` 원장을 사용합니다. 각 계좌는 모의자금 5백만원,
+주문금액 2만5천원이며 일손실과 peak drawdown의 하드 경계는 모두 10%입니다.
+10% 이상이면 신규 진입을 차단하고 열린 모의 포지션을 정리한 뒤 halt를
+원장에 영구 기록합니다. 누락된 owner-only 진단 JSON은 재시작 시 원장에서
+복구합니다. 1시간 재진입 제한, KST 일 24회 진입/왕복 cap, 전체 주문손실
+reserve, 체결시점 spread·visible-depth 재검사는 끌 수 없으며 잘못된 runtime
+값은 일반 diagnostic으로 우회하지 않고 시작 실패합니다. 이는 손실 통제와
+진단 개선이지 수익성 증명이 아니며, 자동 코드변경·자동 전략 승격은 하지
+않습니다.
+
+현재 D2 dashboard는 BTC `127.0.0.1:8774`, ETH `:8775`, XRP `:8776`,
+SOL `:8777`입니다. Slack notifier는 명시적으로 비활성화되어 있고 모든 경로는
+public-feed simulated, `orders_sent=0`입니다.
+
+## Strategy Research V2 결과
+
+기존 72시간 예상수익 모델과 초단기 diagnostic shadow의 손실을 본 뒤,
+`KRW-BTC`, `KRW-ETH`, `KRW-XRP`, `KRW-SOL`을 각각 25% sleeve로 고정해
+느린 예상수익(C1), 336/168시간 돌파 추세(C2), 두 전략의 50/50 혼합(C3)을
+검사했습니다. 아래 수익률은 포트폴리오 전체의 `기본 비용 / 비용 2배` 결과입니다.
+
+| 후보 | D1 2024-07~2025-01 | D2 2025-01~2025-07 | D3 2025-07~2026-07 | 개발 판정 |
+|---|---:|---:|---:|---|
+| C0 기존 ER72, 비교 전용 | -1.879% / -2.154% | +0.517% / +0.202% | +0.370% / -0.262% | 평가 제외 |
+| C1 느린 ER168 | +0.488% / +0.095% | -1.528% / -1.934% | +0.444% / -0.048% | FAIL |
+| C2 추세 돌파 336/168 | +2.869% / +2.192% | +3.594% / +3.084% | -3.914% / -4.308% | PASS |
+| C3 C1/C2 50/50 | +1.679% / +1.144% | +1.033% / +0.575% | -1.735% / -2.178% | PASS |
+
+D1·D2만 사용하는 동결 규칙에서는 C2가 다음 development challenger로
+선정됐습니다. 그러나 D3는 설계 전에 이미 확인한 오염된 진단 구간이고, C2와
+C3가 이 최신 구간에서 모두 손실이므로 승격 근거가 아닙니다. 활성 champion은
+계속 `cash/observe-only`이며, 초단기 diagnostic 정책도 alpha로 재가동하지
+않습니다. C2의 다음 증거는 변경 없는 새 forward-paper 원장에서 쌓아야 합니다.
+
+동일한 고정 suite는 다음처럼 다시 실행합니다. 계산 코드·입력 캔들·후보 설정과
+각 산출물의 SHA-256이 함께 기록되며, 거래소 주문 경로는 없습니다.
+
+```bash
+./scripts/run-strategy-research-v2 \
+  --output-dir artifacts/strategy-v2/review-$(date +%F)
+```
+
+세부 gate와 오염 방지 규칙은
+[`docs/STRATEGY_RESEARCH_V2.md`](docs/STRATEGY_RESEARCH_V2.md)에 있습니다.
+20%는 장기 확인 목표이지 보장 수익률이 아닙니다.
 
 ## 모의매매
 

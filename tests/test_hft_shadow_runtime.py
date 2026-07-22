@@ -477,6 +477,34 @@ def test_restart_with_changed_fingerprint_cannot_auto_resume(
     )
 
 
+def test_external_halt_survives_feed_gap_and_repeated_halt_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    store, engine = _engine(tmp_path)
+    engine.process_book(_book(1, 100))
+    engine.halt("daily_loss", observed_wall_ns=WALL_BASE + 150)
+    before = store.table_counts(engine.run_id)
+
+    gap = engine.process_book(
+        _book(
+            2,
+            200,
+            gap_before=True,
+            gap_reason="websocket_reconnect",
+        )
+    )
+    assert gap.lifecycle_status == "halted_recovery"
+    assert engine.status()["halt_reason"] == "external_halt:daily_loss"
+
+    next_book = engine.process_book(_book(3, 300))
+    assert next_book.lifecycle_status == "halted_recovery"
+    assert engine.status()["halt_reason"] == "external_halt:daily_loss"
+
+    assert engine.halt("daily_loss", observed_wall_ns=WALL_BASE + 350) == 0
+    after = store.table_counts(engine.run_id)
+    assert after["notification_outbox"] == before["notification_outbox"] + 1
+
+
 def test_deterministic_source_collision_is_rejected(tmp_path: Path) -> None:
     _, engine = _engine(tmp_path)
     intent = ShadowIntent(

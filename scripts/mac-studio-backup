@@ -24,13 +24,39 @@ while [[ $# -gt 0 ]]; do
 done
 
 CONFIG_PATH="${APP_HOME}/config/config.toml"
+PAPER_CONFIG_PATH="${APP_HOME}/config/paper.toml"
+RUNTIME_ENV="${APP_HOME}/config/runtime.env"
 BACKUP_DIR="${APP_HOME}/backups"
 STATE_DIR="${APP_HOME}/state"
 VENV_PYTHON="${APP_HOME}/venv/bin/python"
 
-DB_PATH="${APP_HOME}/data/shadow.db"
+runtime_value() {
+  local key="$1"
+  local fallback="$2"
+  local value=""
+  if [[ -f "${RUNTIME_ENV}" ]]; then
+    value="$(awk -F= -v wanted="${key}" '
+      $0 !~ /^[[:space:]]*#/ && $1 == wanted {
+        sub(/^[^=]*=/, "")
+        print
+        exit
+      }
+    ' "${RUNTIME_ENV}")"
+  fi
+  if [[ -n "${value}" ]]; then printf '%s' "${value}"; else printf '%s' "${fallback}"; fi
+}
+
+is_true() {
+  case "$1" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+SHADOW_DB_PATH="${APP_HOME}/data/shadow.db"
+PAPER_DB_PATH="${APP_HOME}/data/coinpilot-c2.db"
 if [[ -x "${VENV_PYTHON}" && -f "${CONFIG_PATH}" ]]; then
-  DB_PATH="$("${VENV_PYTHON}" - "${CONFIG_PATH}" shadow.database_path <<'PY'
+  SHADOW_DB_PATH="$("${VENV_PYTHON}" - "${CONFIG_PATH}" shadow.database_path <<'PY'
 import pathlib
 import sys
 import tomllib
@@ -51,19 +77,48 @@ print(config[section][key])
 PY
 )"
 fi
+PAPER_ENABLED="$(runtime_value COINPILOT_ENABLE_PAPER 0)"
+if is_true "${PAPER_ENABLED}"; then
+  if [[ ! -x "${VENV_PYTHON}" || ! -f "${PAPER_CONFIG_PATH}" ]]; then
+    echo "error: enabled paper config or Python environment is missing" >&2
+    exit 1
+  fi
+  PAPER_DB_PATH="$("${VENV_PYTHON}" - "${PAPER_CONFIG_PATH}" <<'PY'
+import pathlib
+import sys
+
+from coinpilot.config import load_config
+
+print(load_config(pathlib.Path(sys.argv[1])).data.database_path)
+PY
+)"
+  EXPECTED_PAPER_DB="$("${VENV_PYTHON}" - "${APP_HOME}/data/coinpilot-c2.db" <<'PY'
+import pathlib
+import sys
+
+print(pathlib.Path(sys.argv[1]).expanduser().resolve())
+PY
+)"
+  if [[ "${PAPER_DB_PATH}" != "${EXPECTED_PAPER_DB}" ]]; then
+    echo "error: paper database must be ${EXPECTED_PAPER_DB}, found ${PAPER_DB_PATH}" >&2
+    exit 1
+  fi
+fi
 TIMESTAMP="$(date -u '+%Y%m%dT%H%M%SZ')"
-DESTINATION="${BACKUP_DIR}/coinpilot-${TIMESTAMP}.sqlite"
+SHADOW_DESTINATION="${BACKUP_DIR}/coinpilot-${TIMESTAMP}.sqlite"
+PAPER_DESTINATION="${BACKUP_DIR}/coinpilot-paper-c2-${TIMESTAMP}.sqlite"
 LOCK_DIR="${STATE_DIR}/backup.lock"
 
 if [[ "${APPLY}" -eq 0 ]]; then
-  printf '[dry-run] SQLite online backup %q -> %q\n' "${DB_PATH}" "${DESTINATION}"
+  printf '[dry-run] SQLite online backup %q -> %q\n' \
+    "${SHADOW_DB_PATH}" "${SHADOW_DESTINATION}"
+  if is_true "${PAPER_ENABLED}"; then
+    printf '[dry-run] SQLite online backup %q -> %q\n' \
+      "${PAPER_DB_PATH}" "${PAPER_DESTINATION}"
+  fi
   exit 0
 fi
 
-if [[ ! -f "${DB_PATH}" ]]; then
-  echo "No database yet; backup skipped: ${DB_PATH}"
-  exit 0
-fi
 if [[ ! -x "${VENV_PYTHON}" ]]; then
   echo "error: Python environment missing: ${VENV_PYTHON}" >&2
   exit 1
@@ -92,38 +147,69 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-"${VENV_PYTHON}" - "${DB_PATH}" "${DESTINATION}" <<'PY'
+SOURCES=()
+DESTINATIONS=()
+if [[ -f "${SHADOW_DB_PATH}" ]]; then
+  SOURCES[${#SOURCES[@]}]="${SHADOW_DB_PATH}"
+  DESTINATIONS[${#DESTINATIONS[@]}]="${SHADOW_DESTINATION}"
+else
+  echo "No shadow database yet; backup skipped: ${SHADOW_DB_PATH}"
+fi
+if is_true "${PAPER_ENABLED}"; then
+  if [[ -f "${PAPER_DB_PATH}" ]]; then
+    SOURCES[${#SOURCES[@]}]="${PAPER_DB_PATH}"
+    DESTINATIONS[${#DESTINATIONS[@]}]="${PAPER_DESTINATION}"
+  else
+    echo "No paper database yet; backup skipped: ${PAPER_DB_PATH}"
+  fi
+fi
+
+if [[ "${#SOURCES[@]}" -eq 0 ]]; then
+  exit 0
+fi
+
+BACKUP_ARGS=()
+for index in "${!SOURCES[@]}"; do
+  BACKUP_ARGS[${#BACKUP_ARGS[@]}]="${SOURCES[$index]}"
+  BACKUP_ARGS[${#BACKUP_ARGS[@]}]="${DESTINATIONS[$index]}"
+done
+
+"${VENV_PYTHON}" - "${BACKUP_ARGS[@]}" <<'PY'
 import hashlib
 import os
 import pathlib
 import sqlite3
 import sys
 
-source_path = pathlib.Path(sys.argv[1]).resolve()
-destination = pathlib.Path(sys.argv[2]).resolve()
-temporary = destination.with_name(destination.name + ".partial")
-temporary.unlink(missing_ok=True)
+arguments = sys.argv[1:]
+if len(arguments) % 2:
+    raise SystemExit("backup source/destination arguments must be paired")
 
-source_uri = f"file:{source_path.as_posix()}?mode=ro"
-source = sqlite3.connect(source_uri, uri=True, timeout=30)
-target = sqlite3.connect(temporary)
-try:
-    source.backup(target)
-    result = target.execute("PRAGMA integrity_check").fetchone()
-    if not result or result[0] != "ok":
-        raise RuntimeError(f"backup integrity_check failed: {result!r}")
-finally:
-    target.close()
-    source.close()
+for source_arg, destination_arg in zip(arguments[0::2], arguments[1::2]):
+    source_path = pathlib.Path(source_arg).resolve()
+    destination = pathlib.Path(destination_arg).resolve()
+    temporary = destination.with_name(destination.name + ".partial")
+    temporary.unlink(missing_ok=True)
 
-os.chmod(temporary, 0o600)
-os.replace(temporary, destination)
-digest = hashlib.sha256(destination.read_bytes()).hexdigest()
-checksum = destination.with_name(destination.name + ".sha256")
-checksum_tmp = checksum.with_name(checksum.name + ".tmp")
-checksum_tmp.write_text(f"{digest}  {destination.name}\n", encoding="ascii")
-os.chmod(checksum_tmp, 0o600)
-os.replace(checksum_tmp, checksum)
+    source_uri = f"file:{source_path.as_posix()}?mode=ro"
+    source = sqlite3.connect(source_uri, uri=True, timeout=30)
+    target = sqlite3.connect(temporary)
+    try:
+        source.backup(target)
+        result = target.execute("PRAGMA integrity_check").fetchone()
+        if not result or result[0] != "ok":
+            raise RuntimeError(f"backup integrity_check failed: {result!r}")
+    finally:
+        target.close()
+        source.close()
+
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, destination)
+    digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+    checksum = destination.with_name(destination.name + ".sha256")
+    checksum_tmp = checksum.with_name(checksum.name + ".tmp")
+    checksum_tmp.write_text(f"{digest}  {destination.name}\n", encoding="ascii")
+    os.chmod(checksum_tmp, 0o600)
+    os.replace(checksum_tmp, checksum)
+    print(f"Verified backup created: {destination}")
 PY
-
-echo "Verified backup created: ${DESTINATION}"

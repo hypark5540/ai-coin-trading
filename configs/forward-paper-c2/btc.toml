@@ -1,0 +1,91 @@
+# Frozen C2 forward-paper configuration. No credentials or live orders.
+# strategy_policy_sha256 = ef3bd260b246d58f67968bbc3db0a43d7975b61b71966803bc9366a70c3fe3de
+
+[data]
+market = "KRW-BTC"
+interval_minutes = 60
+candle_count = 2500
+api_base_url = "https://api.upbit.com"
+request_timeout_seconds = 10.0
+database_path = "../../var/forward-paper-c2/btc/coinpilot-c2.db"
+
+[model]
+signal_mode = "trend_breakout"
+horizon_bars = 336
+min_train_samples = 500
+train_window = 1500
+retrain_every = 24
+entry_probability = 0.58
+exit_probability = 0.48
+minimum_edge_pct = 0.001
+l2 = 0.01
+learning_rate = 0.08
+max_iterations = 250
+calibration_window = 240
+calibration_min_samples = 120
+calibration_uncertainty_z = 1.0
+target_clip_quantile = 0.01
+regime_sma_window = 168
+regime_sma_gap_min = -1.0
+breakout_entry_window = 336
+breakout_exit_window = 168
+
+[risk]
+initial_cash = 2500000.0
+risk_per_trade = 0.0075
+max_position_fraction = 0.5
+atr_stop_multiple = 2.0
+minimum_stop_pct = 0.01
+maximum_stop_pct = 0.08
+trailing_stop_pct = 0.08
+max_strategy_drawdown_pct = 0.15
+fee_rate = 0.0005
+slippage_bps = 5.0
+cooldown_bars = 6
+minimum_order_quote = 5000.0
+
+[paper]
+history_candles = 2500
+poll_seconds = 30
+max_signal_delay_seconds = 120
+max_ticker_age_seconds = 60
+account_name = "c2-forward-v1-krw-btc"
+
+[output]
+artifacts_dir = "../../artifacts/forward-paper-c2/btc"
+
+[shadow]
+mode = "observe"
+database_path = "../../var/forward-paper-c2/btc/c2-paper-shadow-disabled.db"
+archive_root = "../../var/forward-paper-c2/btc/c2-paper-shadow-disabled"
+initial_cash = 2500000.0
+order_quote = 125000.0
+fee_rate = 0.0005
+latency_ms = 100.0
+max_book_gap_ms = 1000.0
+warmup_books = 100
+trade_flow_window_ms = 1000
+entry_threshold = 0.45
+exit_threshold = 0.0
+max_holding_seconds = 60.0
+max_spread_bps = 10.0
+max_daily_loss_pct = 0.01
+max_drawdown_pct = 0.05
+equity_sample_seconds = 5
+health_sample_seconds = 10
+partition_seconds = 300
+session_seconds = 31536000.0
+model_version = "c2-paper-config-shadow-disabled-v1"
+
+[operations]
+bind_host = "127.0.0.1"
+port = 8768
+heartbeat_seconds = 10
+stale_after_seconds = 60
+notifier_poll_seconds = 2
+keychain_service = "coinpilot-c2-paper-no-webhook"
+keychain_account = "c2-forward-v1-krw-btc"
+backup_dir = "../../var/forward-paper-c2/btc/backups"
+archive_retention_days = 90
+disk_warning_pct = 0.15
+disk_halt_pct = 0.05

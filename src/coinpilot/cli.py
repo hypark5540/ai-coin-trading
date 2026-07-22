@@ -4,6 +4,7 @@ import argparse
 import dataclasses
 import json
 import math
+import re
 import signal
 import sqlite3
 import sys
@@ -78,6 +79,27 @@ from coinpilot.research import (
     write_research_assessment,
 )
 from coinpilot.store import SQLiteStore
+
+
+def _safe_cli_error(exc: BaseException) -> str:
+    """Render a bounded, scrubbed error and one useful chained cause."""
+
+    message = str(exc)
+    if isinstance(exc, HFTArchiveError) and exc.__cause__ is not None:
+        cause = exc.__cause__
+        message = f"{message}; cause={type(cause).__name__}: {cause}"
+    message = message[:2_000]
+    message = re.sub(
+        r"https://hooks\.slack\.com/services/[A-Za-z0-9/_-]+",
+        "[REDACTED_SLACK_WEBHOOK]",
+        message,
+    )
+    return re.sub(
+        r"\b(?:xox[a-z]-|Bearer\s+)[A-Za-z0-9._-]+",
+        "[REDACTED_TOKEN]",
+        message,
+        flags=re.IGNORECASE,
+    )
 from coinpilot.hft_shadow_signal import ShadowSignalError
 from coinpilot.hft_shadow_store import ShadowStoreError
 from coinpilot.shadow_cli import (
@@ -345,6 +367,10 @@ def _cmd_status(args: argparse.Namespace, config: AppConfig) -> int:
     events = store.recent_paper_events(account_key, limit=args.events)
     _json_print(
         {
+            "mode": "forward_paper_status",
+            "simulated": True,
+            "live_order_routing": False,
+            "orders_sent": 0,
             "account_key": account_key,
             "state": state,
             "recent_events": events,
@@ -1602,7 +1628,7 @@ def main(argv: list[str] | None = None) -> None:
         ShadowOperationsError,
         ShadowServiceError,
     ) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        print(f"error: {_safe_cli_error(exc)}", file=sys.stderr)
         exit_code = 2
     except KeyboardInterrupt:
         print("Interrupted.", file=sys.stderr)

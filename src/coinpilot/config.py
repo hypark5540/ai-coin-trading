@@ -13,6 +13,10 @@ SUPPORTED_MINUTE_INTERVALS = (1, 3, 5, 10, 15, 30, 60, 240)
 MARKET_PATTERN = re.compile(r"^[A-Z0-9]+-[A-Z0-9]+$")
 FEATURE_WARMUP_BARS = 168
 PROBABILITY_FEATURE_WARMUP_BARS = 72
+PROBABILITY_SIGNAL_MODES = frozenset({"probability", "trend_breakout"})
+SUPPORTED_SIGNAL_MODES = frozenset(
+    {*PROBABILITY_SIGNAL_MODES, "expected_return"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,6 +48,8 @@ class ModelConfig:
     target_clip_quantile: float = 0.01
     regime_sma_window: int = 168
     regime_sma_gap_min: float = -1.0
+    breakout_entry_window: int = 336
+    breakout_exit_window: int = 168
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +187,8 @@ class AppConfig:
             "calibration_window": m.calibration_window,
             "calibration_min_samples": m.calibration_min_samples,
             "regime_sma_window": m.regime_sma_window,
+            "breakout_entry_window": m.breakout_entry_window,
+            "breakout_exit_window": m.breakout_exit_window,
         }
         for name, value in integer_model_fields.items():
             if isinstance(value, bool) or not isinstance(value, int):
@@ -197,9 +205,33 @@ class AppConfig:
             errors.append("model.train_window must be >= model.min_train_samples")
         if isinstance(m.retrain_every, int) and m.retrain_every < 1:
             errors.append("model.retrain_every must be at least 1")
-        if m.signal_mode not in {"probability", "expected_return"}:
+        if m.signal_mode not in SUPPORTED_SIGNAL_MODES:
             errors.append(
-                "model.signal_mode must be probability or expected_return"
+                "model.signal_mode must be probability, expected_return, "
+                "or trend_breakout"
+            )
+        if m.signal_mode == "trend_breakout" and d.interval_minutes != 60:
+            errors.append(
+                "trend_breakout requires data.interval_minutes to be 60"
+            )
+        if (
+            isinstance(m.breakout_entry_window, int)
+            and m.breakout_entry_window < 2
+        ):
+            errors.append("model.breakout_entry_window must be at least 2")
+        if (
+            isinstance(m.breakout_exit_window, int)
+            and m.breakout_exit_window < 2
+        ):
+            errors.append("model.breakout_exit_window must be at least 2")
+        if (
+            isinstance(m.breakout_entry_window, int)
+            and isinstance(m.breakout_exit_window, int)
+            and m.breakout_exit_window >= m.breakout_entry_window
+        ):
+            errors.append(
+                "model.breakout_exit_window must be below "
+                "breakout_entry_window"
             )
         if (
             isinstance(m.calibration_window, int)
@@ -352,26 +384,35 @@ class AppConfig:
         ):
             errors.append("risk cash values must be positive")
 
-        feature_warmup = (
-            max(FEATURE_WARMUP_BARS, m.regime_sma_window)
-            if m.signal_mode == "expected_return"
-            else PROBABILITY_FEATURE_WARMUP_BARS
-        )
-        required_history = (
-            max(
-                m.min_train_samples + m.horizon_bars + 80,
-                m.train_window
-                + feature_warmup
-                + m.horizon_bars
-                + m.retrain_every
-                + 1,
+        if m.signal_mode == "trend_breakout":
+            feature_warmup = (
+                max(m.breakout_entry_window, m.breakout_exit_window)
+                if isinstance(m.breakout_entry_window, int)
+                and isinstance(m.breakout_exit_window, int)
+                else 0
             )
-            if isinstance(m.min_train_samples, int)
-            and isinstance(m.horizon_bars, int)
-            and isinstance(m.train_window, int)
-            and isinstance(m.retrain_every, int)
-            else 0
-        )
+            required_history = feature_warmup + 1
+        else:
+            feature_warmup = (
+                max(FEATURE_WARMUP_BARS, m.regime_sma_window)
+                if m.signal_mode == "expected_return"
+                else PROBABILITY_FEATURE_WARMUP_BARS
+            )
+            required_history = (
+                max(
+                    m.min_train_samples + m.horizon_bars + 80,
+                    m.train_window
+                    + feature_warmup
+                    + m.horizon_bars
+                    + m.retrain_every
+                    + 1,
+                )
+                if isinstance(m.min_train_samples, int)
+                and isinstance(m.horizon_bars, int)
+                and isinstance(m.train_window, int)
+                and isinstance(m.retrain_every, int)
+                else 0
+            )
         if isinstance(d.candle_count, int) and d.candle_count < required_history:
             errors.append(
                 f"data.candle_count must be at least {required_history} for this model"
@@ -533,6 +574,11 @@ class AppConfig:
 
     @property
     def feature_warmup_bars(self) -> int:
+        if self.model.signal_mode == "trend_breakout":
+            return max(
+                self.model.breakout_entry_window,
+                self.model.breakout_exit_window,
+            )
         return (
             max(FEATURE_WARMUP_BARS, self.model.regime_sma_window)
             if self.model.signal_mode == "expected_return"
@@ -541,6 +587,8 @@ class AppConfig:
 
     @property
     def minimum_history_bars(self) -> int:
+        if self.model.signal_mode == "trend_breakout":
+            return self.feature_warmup_bars + 1
         return max(
             self.model.min_train_samples + self.model.horizon_bars + 80,
             self.model.train_window

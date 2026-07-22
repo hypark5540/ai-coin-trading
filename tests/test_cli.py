@@ -20,8 +20,23 @@ from coinpilot.hft_data import (
     profile_hft_events,
 )
 from coinpilot.hft_workflow import verify_artifact_completion
-from coinpilot.paper import TickerNotReadyError
+from coinpilot.paper import TickerNotReadyError, paper_config_fingerprint
 from coinpilot.store import SQLiteStore
+
+
+def test_cli_archive_error_includes_scrubbed_chained_cause() -> None:
+    secret = "https://hooks.slack.com/services/T/B/SECRET"
+    try:
+        try:
+            raise RuntimeError(f"collision {secret}")
+        except RuntimeError as cause:
+            raise cli.HFTArchiveError("consumer failed") from cause
+    except cli.HFTArchiveError as exc:
+        message = cli._safe_cli_error(exc)
+
+    assert "cause=RuntimeError: collision" in message
+    assert secret not in message
+    assert "[REDACTED_SLACK_WEBHOOK]" in message
 
 
 class _StaticCandleClient:
@@ -185,6 +200,41 @@ def test_paper_loop_retries_a_ticker_that_is_not_ready(
     captured = capsys.readouterr()
     assert attempts == 2
     assert "TickerNotReadyError" in captured.err
+
+
+def test_paper_status_declares_simulation_and_zero_live_orders(
+    tmp_path, capsys
+) -> None:
+    base = AppConfig()
+    config = dataclasses.replace(
+        base,
+        data=dataclasses.replace(
+            base.data, database_path=str(tmp_path / "coinpilot.db")
+        ),
+        paper=dataclasses.replace(base.paper, account_name="c2-forward-test"),
+    ).validate()
+    store = SQLiteStore(config.data.database_path)
+    account_key = cli.paper_account_key(config)
+    state = {
+        "market": config.data.market,
+        "cash": config.risk.initial_cash,
+        "peak_equity": config.risk.initial_cash,
+        "config_fingerprint": paper_config_fingerprint(config),
+    }
+    store.save_paper_step(account_key, state, [], expected_revision=0)
+
+    args = argparse.Namespace(
+        config=tmp_path / "paper.toml",
+        events=1,
+    )
+    assert cli._cmd_status(args, config) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["mode"] == "forward_paper_status"
+    assert payload["simulated"] is True
+    assert payload["live_order_routing"] is False
+    assert payload["orders_sent"] == 0
+    assert payload["account_key"] == account_key
 
 
 def _hft_book(timestamp_ms: int, received_at_ns: int) -> dict[str, object]:

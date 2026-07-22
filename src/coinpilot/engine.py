@@ -17,7 +17,7 @@ from coinpilot.broker import (
     SimulatedBroker,
     Trade,
 )
-from coinpilot.config import ModelConfig, RiskConfig
+from coinpilot.config import PROBABILITY_SIGNAL_MODES, ModelConfig, RiskConfig
 from coinpilot.risk import RiskManager
 
 
@@ -197,7 +197,8 @@ class BarExecutionEngine:
                 position_exited_this_bar = True
                 self.state.halt_state = HALTED
             elif (
-                self.model_config.signal_mode == "expected_return"
+                self.model_config.signal_mode
+                in {"expected_return", "trend_breakout"}
                 and self.state.entry_horizon_exit_time is not None
                 and timestamp
                 >= pd.Timestamp(self.state.entry_horizon_exit_time)
@@ -213,7 +214,7 @@ class BarExecutionEngine:
                 trades.append(trade)
                 position_exited_this_bar = True
             elif (
-                self.model_config.signal_mode == "probability"
+                self.model_config.signal_mode in PROBABILITY_SIGNAL_MODES
                 and
                 execution_probability is not None
                 and np.isfinite(execution_probability)
@@ -231,7 +232,7 @@ class BarExecutionEngine:
                 position_exited_this_bar = True
 
         probability_entry = bool(
-            self.model_config.signal_mode == "probability"
+            self.model_config.signal_mode in PROBABILITY_SIGNAL_MODES
             and execution_probability is not None
             and np.isfinite(execution_probability)
             and execution_probability >= self.model_config.entry_probability
@@ -267,7 +268,10 @@ class BarExecutionEngine:
                     model_id=execution_model_id,
                 )
                 events.append(_fill_event(fill))
-                if self.model_config.signal_mode == "expected_return":
+                if self.model_config.signal_mode in {
+                    "expected_return",
+                    "trend_breakout",
+                }:
                     self.state.entry_horizon_exit_time = (
                         timestamp
                         + pd.Timedelta(
@@ -359,7 +363,7 @@ class BarExecutionEngine:
             float(current_probability)
             if current_probability is not None
             and np.isfinite(current_probability)
-            and self.model_config.signal_mode == "probability"
+            and self.model_config.signal_mode in PROBABILITY_SIGNAL_MODES
             and self.state.halt_state == HALT_ACTIVE
             else None
         )
@@ -389,7 +393,7 @@ class BarExecutionEngine:
         )
         signal_available = (
             probability is not None
-            if self.model_config.signal_mode == "probability"
+            if self.model_config.signal_mode in PROBABILITY_SIGNAL_MODES
             else expected_net_edge is not None
         )
         atr_value = (

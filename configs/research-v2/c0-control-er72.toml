@@ -1,0 +1,52 @@
+[data]
+market = "KRW-BTC"
+interval_minutes = 60
+candle_count = 52600
+api_base_url = "https://api.upbit.com"
+request_timeout_seconds = 10.0
+database_path = "../../var/research-v2-candles.db"
+
+[model]
+signal_mode = "expected_return"
+horizon_bars = 72
+min_train_samples = 3000
+train_window = 8760
+retrain_every = 168
+entry_probability = 0.58
+exit_probability = 0.48
+minimum_edge_pct = 0.0015
+l2 = 0.10
+learning_rate = 0.08
+max_iterations = 250
+calibration_window = 720
+calibration_min_samples = 480
+calibration_uncertainty_z = 1.0
+target_clip_quantile = 0.01
+regime_sma_window = 168
+regime_sma_gap_min = 0.0
+breakout_entry_window = 336
+breakout_exit_window = 168
+
+[risk]
+initial_cash = 2500000
+risk_per_trade = 0.0075
+max_position_fraction = 0.50
+atr_stop_multiple = 2.0
+minimum_stop_pct = 0.01
+maximum_stop_pct = 0.08
+trailing_stop_pct = 0.08
+max_strategy_drawdown_pct = 0.15
+fee_rate = 0.0005
+slippage_bps = 5.0
+cooldown_bars = 6
+minimum_order_quote = 5000
+
+[paper]
+history_candles = 12000
+poll_seconds = 30
+max_signal_delay_seconds = 120
+max_ticker_age_seconds = 60
+account_name = "research-v2-c0"
+
+[output]
+artifacts_dir = "../../artifacts/strategy-v2/c0-control-er72"

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>@@LABEL@@</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@@SERVICE_EXECUTABLE@@</string>
+    <string>paper</string>
+  </array>
+  <key>WorkingDirectory</key><string>@@APP_HOME@@</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>COINPILOT_HOME</key><string>@@APP_HOME@@</string>
+    <key>COINPILOT_REPO_ROOT</key><string>@@REPO_ROOT@@</string>
+    <key>COINPILOT_CONFIG</key><string>@@CONFIG_PATH@@</string>
+    <key>COINPILOT_RUNTIME_ENV</key><string>@@RUNTIME_ENV@@</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>60</integer>
+  <key>ProcessType</key><string>Background</string>
+  <key>Nice</key><integer>5</integer>
+  <key>Umask</key><integer>63</integer>
+  <key>StandardOutPath</key><string>@@LOG_DIR@@/paper.stdout.log</string>
+  <key>StandardErrorPath</key><string>@@LOG_DIR@@/paper.stderr.log</string>
+</dict>
+</plist>

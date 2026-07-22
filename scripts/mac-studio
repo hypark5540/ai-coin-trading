@@ -1008,9 +1008,24 @@ service_is_running() {
   kill -0 "${pid}" 2>/dev/null
 }
 
+wait_for_service_unloaded() {
+  local service="$1"
+  local attempt
+  for attempt in {1..30}; do
+    if ! service_is_loaded "${service}"; then
+      return 0
+    fi
+    if [[ "${attempt}" -lt 30 ]]; then
+      /bin/sleep 1
+    fi
+  done
+  return 1
+}
+
 bootout_service() {
   local service="$1"
   local domain
+  local launch_error=""
   domain="$(launch_domain 2>/dev/null || true)"
   if [[ -z "${domain}" ]]; then
     if [[ "${APPLY}" -eq 1 ]]; then
@@ -1023,7 +1038,13 @@ bootout_service() {
   if [[ "${APPLY}" -eq 0 ]]; then
     quote_cmd launchctl bootout "${domain}/$(service_label "${service}")"
   elif service_is_loaded "${service}"; then
-    launchctl bootout "${domain}/$(service_label "${service}")"
+    if launch_error="$(launchctl bootout \
+        "${domain}/$(service_label "${service}")" 2>&1)"; then
+      wait_for_service_unloaded "${service}" ||
+        die "launchctl bootout did not finish for ${service} within 30 seconds"
+    elif service_is_loaded "${service}"; then
+      die "launchctl bootout failed for ${service}: ${launch_error}"
+    fi
   fi
 }
 
@@ -1045,9 +1066,14 @@ bootstrap_service() {
   launchctl enable "${domain}/$(service_label "${service}")" >/dev/null 2>&1 || true
   for attempt in 1 2 3 4 5; do
     if launch_error="$(launchctl bootstrap "${domain}" "${plist}" 2>&1)"; then
-      return 0
-    fi
-    if service_is_loaded "${service}"; then
+      # launchctl can acknowledge bootstrap before an earlier asynchronous
+      # bootout has fully settled. Verify the replacement survives that edge.
+      /bin/sleep 1
+      if service_is_loaded "${service}"; then
+        return 0
+      fi
+      launch_error="bootstrap returned success but ${service} did not remain loaded"
+    elif service_is_loaded "${service}"; then
       return 0
     fi
     if [[ "${attempt}" -lt 5 ]]; then
@@ -1475,8 +1501,16 @@ stop_one() {
 }
 
 restart_one() {
-  stop_one "$1"
-  start_one "$1"
+  local service="$1"
+  if service_enabled "${service}"; then
+    # bootstrap_service already unloads an existing job before loading it.
+    # A separate stop here can race launchd's asynchronous bootout and remove
+    # the newly bootstrapped replacement after this command reports success.
+    start_one "${service}"
+  else
+    stop_one "${service}"
+    note "Skipping disabled service: ${service}"
+  fi
 }
 
 show_status() {

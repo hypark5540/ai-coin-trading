@@ -236,6 +236,97 @@ if grep -Fq 'paper account        ready' "${TMP_ROOT}/paper-not-running.log"; th
 fi
 echo "OK loaded paper job without a running PID is never ready"
 
+RESTART_RACE_BIN="${TMP_ROOT}/restart-race-bin"
+RESTART_RACE_HOME="${TMP_ROOT}/restart-race-home"
+RESTART_RACE_APP="${TMP_ROOT}/restart-race-app"
+RESTART_RACE_LOG="${TMP_ROOT}/restart-race.log"
+RESTART_RACE_STATE="${TMP_ROOT}/restart-race.state"
+RESTART_RACE_EARLY="${TMP_ROOT}/restart-race.early"
+mkdir -p \
+  "${RESTART_RACE_BIN}" \
+  "${RESTART_RACE_HOME}/Library/LaunchAgents"
+touch "${RESTART_RACE_HOME}/Library/LaunchAgents/dev.coinpilot.shadow.plist"
+printf '%s\n' loaded > "${RESTART_RACE_STATE}"
+cat > "${RESTART_RACE_BIN}/uname" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-s" ]]; then
+  printf '%s\n' Darwin
+  exit 0
+fi
+exit 64
+SH
+cat > "${RESTART_RACE_BIN}/launchctl" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "${TEST_LAUNCHCTL_LOG:?}"
+case "${1:-}" in
+  print)
+    case "${2:-}" in
+      */dev.coinpilot.shadow)
+        state="$(cat "${TEST_LAUNCHCTL_STATE:?}" 2>/dev/null || true)"
+        case "${state}" in
+          loaded) exit 0 ;;
+          stopping:*)
+            remaining="${state#stopping:}"
+            if [[ "${remaining}" -gt 1 ]]; then
+              printf 'stopping:%s\n' "$((remaining - 1))" \
+                > "${TEST_LAUNCHCTL_STATE}"
+              exit 0
+            fi
+            rm -f "${TEST_LAUNCHCTL_STATE}"
+            exit 1
+            ;;
+          *) exit 1 ;;
+        esac
+        ;;
+      *) exit 0 ;;
+    esac
+    ;;
+  bootout)
+    printf '%s\n' 'stopping:2' > "${TEST_LAUNCHCTL_STATE:?}"
+    exit 0
+    ;;
+  bootstrap)
+    if [[ -e "${TEST_LAUNCHCTL_STATE:?}" ]]; then
+      touch "${TEST_LAUNCHCTL_EARLY:?}"
+      exit 0
+    fi
+    printf '%s\n' loaded > "${TEST_LAUNCHCTL_STATE}"
+    exit 0
+    ;;
+  enable) exit 0 ;;
+  *) exit 64 ;;
+esac
+SH
+chmod 755 \
+  "${RESTART_RACE_BIN}/uname" \
+  "${RESTART_RACE_BIN}/launchctl"
+PATH="${RESTART_RACE_BIN}:/usr/bin:/bin" \
+  HOME="${RESTART_RACE_HOME}" \
+  TEST_LAUNCHCTL_LOG="${RESTART_RACE_LOG}" \
+  TEST_LAUNCHCTL_STATE="${RESTART_RACE_STATE}" \
+  TEST_LAUNCHCTL_EARLY="${RESTART_RACE_EARLY}" \
+  "${REPO_ROOT}/scripts/mac-studio" restart shadow \
+  --home "${RESTART_RACE_APP}" --apply
+if [[ "$(grep -c '^bootout ' "${RESTART_RACE_LOG}")" -ne 1 ]]; then
+  echo "error: restart issued more than one launchd bootout" >&2
+  exit 1
+fi
+grep -Fq 'bootstrap ' "${RESTART_RACE_LOG}"
+if [[ -e "${RESTART_RACE_EARLY}" ]]; then
+  echo "error: restart bootstrapped while the old job was still unloading" >&2
+  exit 1
+fi
+if [[ "$(cat "${RESTART_RACE_STATE}")" != "loaded" ]]; then
+  echo "error: restart bootstrapped before the old job fully unloaded" >&2
+  exit 1
+fi
+expected_restart_probe="print gui/$(id -u)/dev.coinpilot.shadow"
+if [[ "$(tail -n 1 "${RESTART_RACE_LOG}")" != "${expected_restart_probe}" ]]; then
+  echo "error: restart did not verify the bootstrapped launchd job" >&2
+  exit 1
+fi
+echo "OK restart uses one bootout/bootstrap cycle"
+
 PYTHON_DETECTION_BIN="${TMP_ROOT}/python-detection-bin"
 PYTHON_FORMULA_PREFIX="${TMP_ROOT}/homebrew/opt/python@3.12"
 mkdir -p "${PYTHON_DETECTION_BIN}" "${PYTHON_FORMULA_PREFIX}/bin"

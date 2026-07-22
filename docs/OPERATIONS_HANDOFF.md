@@ -1,6 +1,6 @@
 # CoinPilot operations handoff
 
-> 마지막 갱신: 2026-07-23 00:38 KST
+> 마지막 갱신: 2026-07-23 03:08 KST
 > 이 문서는 시점 스냅샷이다. 손익, PID, revision, readiness 같은 동적 값은
 > 반드시 다시 조회하며 현재 관측 결과가 이 문서보다 우선한다.
 
@@ -11,6 +11,7 @@
 | 저장소 | `hypark5540/ai-coin-trading` |
 | branch | `agent/bounded-shadow-risk-controls` |
 | D2 배포 코드 / handoff baseline | `ab784db022047cfaee89d5123a1e6aeac958bb2a` |
+| 중앙 daily-scorecard 배포 코드 | `f5f53909f296dd6a99a1a79a46de7bbdbc5b8b24` |
 | repository HEAD | 세션 시작 시 재조회. handoff 문서 commit은 D2 배포 코드보다 뒤일 수 있음 |
 | PR | Draft PR #1, base `main` |
 | `main` | `9033db3e93e5966a823dd44a6473a2e426e7b77c` |
@@ -19,6 +20,68 @@
 초기화하던 문제를 수정했다. `/api/status`는 feed freshness와 lifecycle을
 분리하고 dashboard는 `Live · warming up`, stale, halted, stopped를 구분한다.
 `/health/ready`의 running+fresh fail-closed 계약은 바뀌지 않았다.
+
+## 2026-07-23 통합 일일 성적표 배포
+
+03:06 KST에 중앙 LaunchAgent `dev.coinpilot.daily-scorecard` 하나를 설치하고
+명시적으로 enabled 처리했다. 이 job은 매시 `:10`에 one-shot으로 실행하되 정상
+일일 deadline은 `00:10 KST`다. 승인된 D2/C2 8개 원장을 SQLite `mode=ro`와
+`query_only`의 단일 read transaction으로 조회하고, 거래 instance의 package,
+config, fingerprint, DB, outbox 또는 per-instance notifier는 변경하지 않는다.
+
+배포 직전 `f5f5390`의 [PR CI](https://github.com/hypark5540/ai-coin-trading/actions/runs/29944739416)와
+[Push CI](https://github.com/hypark5540/ai-coin-trading/actions/runs/29944735731)에서
+Ubuntu/macOS 4개 작업이 모두 성공했다.
+로컬 전체 pytest는 `352 passed`, `./scripts/mac-studio test`와
+`git diff --check`도 성공했다. 첫 Ubuntu CI 실패는 GNU/BSD `stat -f` 의미 차이인
+테스트 이식성 문제였고, Python `stat.S_IMODE` 검사로 교체한 뒤 4개 CI를 다시
+통과했다.
+
+RunAtLoad가 최신 완료일을 먼저 보내고 수동 one-shot 한 번으로 최초 source
+일자의 backlog를 보냈다. 둘 다 Slack 성공 뒤 local receipt가 첫 시도에
+`delivered`가 됐으며 `last_error=null`이다.
+
+| KST 일자 | report ID | D2 일 회계 P&L / RT / fee | C2 일 회계 P&L / RT / fee | JSON SHA-256 |
+| --- | --- | --- | --- | --- |
+| 2026-07-22 | `daily-scorecard:v1:2026-07-22` | -₩476.390223 / 14 / ₩349.936773 | -₩14,583.350868 / 1 / ₩618.329990 | `858e9c959720d46d14caef93308adbb6e6ce198aa640e78fcb24979416c33a19` |
+| 2026-07-21 | `daily-scorecard:v1:2026-07-21` | ₩0 / 0 / ₩0 | ₩0 / 0 / ₩625 | `362c6c1f979a23cbf0dfa279859a3aae061538dd36fec64fee7d8fbe0c4f72ac` |
+
+7월 22일 D2 return/DD는 자정 anchor가 없는 첫 운영일이라 네 시장 모두
+`partial(start +20.0h)`로 표시한다. C2 BTC 일 return은 non-flat boundary의 완료
+60분봉 liquidation 추정치이며 `estimated`로 표시하고, C2 historical intraday
+DD는 원장에 equity history가 없어 `N/A`다. 7월 21일에는 C2 BTC 진입 수수료
+₩625와 turnover ₩1,250,000이 있었고 실현손익/완료 RT는 0이다. 당시 D2는 아직
+시작 전이라 equity coverage가 `unavailable`로 표시된다.
+
+감사 산출물과 delivery state는 모두 다음 private reporting home에 있고 파일
+mode는 `0600`, 디렉터리는 `0700`이다. JSON과 `.sha256` checksum을 재검증했다.
+
+```text
+~/Library/Application Support/Coinpilot/reporting/
+  bin/coinpilot-daily-scorecard
+  reports/coinpilot-daily-scorecard-v1-2026-07-{21,22}.{json,md,sha256}
+  state/deliveries/2026-07-{21,22}.json
+  logs/daily-scorecard.{stdout,stderr}.log
+```
+
+최종 중앙 status는 `delivery_count=2`, `latest_due_delivered=true`,
+`missing_backlog_days=0`, `unresolved_receipts=0`, `healthy=true`이고 Doctor는
+`0 errors`다. Slack webhook은 기존 macOS Keychain item을 argv/env/file/log에
+노출하지 않고 읽었다. Slack 성공 직후 local receipt 기록 전에 전원이 끊기면
+원격·로컬 원자 commit이 불가능해 드문 at-least-once 중복 가능성은 남는다.
+
+배포 전후 비교에서 8개 instance의 config/helper hash, 원장 경로, D2 run ID와
+config/code fingerprint, C2 account/config fingerprint가 모두 동일했다. D2/C2
+거래 PID도 유지됐고 8개 모두 flat, D2 pending 0, reconciliation PASS였다.
+`simulated=true`, `own_execution=false`, `live_order_routing=false`,
+`orders_sent=0`을 다시 확인했다. 이 배포 때문에 D2/C2를 install/update/restart하지
+않았고 새 거래 원장도 만들지 않았다.
+
+자가개선 gate는 현재 `COLLECTING_T0_EVIDENCE`다. C2 공통 관측 1/30일과 완료
+RT 1/30건뿐이므로 손익 결론이나 활성 변경을 하지 않는다. 30일과 30 RT를 모두
+충족해도 causal replay, purged walk-forward, 2배 비용 stress, 운영자 검토를 거친
+새 model/account/ledger 후보만 제안하며 전략·halt·fingerprint·원장을 자동
+변경하거나 rearm하지 않는다.
 
 ## 2026-07-22 재부팅 후 LaunchAgent drift
 
@@ -120,6 +183,7 @@ manifest의 자체 검증은 일치하고 런타임은 ACTIVE이므로 현재 �
 
 - D2/C2 모두 공개 시세 기반 모의거래다.
 - `simulated=true`, `live_order_routing=false`, `orders_sent=0`을 확인했다.
+- 모든 통합 성적표에서 `own_execution=false`도 함께 확인한다.
 - Upbit private API key와 실제 주문 경로는 없다.
 - D2/C2 notifier는 not-loaded이고 launchd persistent disabled이며 D2/C2
   runtime의 `COINPILOT_ENABLE_NOTIFIER=0`을 유지한다.
@@ -129,6 +193,10 @@ manifest의 자체 검증은 일치하고 런타임은 ACTIVE이므로 현재 �
   disabled다. 이 instance를 대상으로 `start`, `install`, `bootstrap`을
   실행하지 않는다.
 - `127.0.0.1:8765`는 다른 로컬 프로젝트 소유이므로 건드리지 않는다.
+- non-instance 구형 default label `dev.coinpilot.shadow/web/external-watchdog/
+  notifier/backup/retention`은 matching plist와 loaded job이 없지만 일부 launchd
+  override가 enabled로 남아 있다. 현재 실행 위험은 없으나 같은 plist가 다시
+  생기면 활성화될 수 있으므로 별도 명시 승인 없이 정리하거나 재사용하지 않는다.
 
 ## 검증 증거
 
@@ -141,6 +209,11 @@ manifest의 자체 검증은 일치하고 런타임은 ACTIVE이므로 현재 �
   warning 0; installed package `verify-installed valid=true`
 - 2026-07-23 현재 로컬 Python: `306 passed`
 - launchd persistent disable 회귀를 포함한 `./scripts/mac-studio test` 성공
+- 중앙 daily-scorecard 배포 전 로컬 Python: `352 passed`
+- 중앙 daily-scorecard 운영·격리 회귀를 포함한 `./scripts/mac-studio test` 성공
+- commit `f5f5390` GitHub Actions: PR/Push Ubuntu/macOS 4개 작업 모두 성공
+- 중앙 reporter Doctor: `0 errors`; 7월 21/22 receipt와 artifact checksum 성공
+- 중앙 배포 전후 D2/C2 managed hash와 run/account fingerprint 동일
 - 배포 전 기존 D2 네 원장 SQLite integrity check와 backup checksum 성공
 - 배포 후 신규 D2 네 원장 SQLite integrity check 성공, run lineage 각 1개
 - 재부팅 후 D2/C2/legacy 관련 DB SQLite integrity check 성공; 현재 D2 run
@@ -168,6 +241,9 @@ for i in c2-btc c2-eth c2-xrp c2-sol; do
   ./scripts/mac-studio status --instance "$i"
   ./scripts/mac-studio doctor --instance "$i"
 done
+
+./scripts/mac-studio-daily-scorecard status
+./scripts/mac-studio-daily-scorecard doctor
 
 launchctl print-disabled "gui/$(id -u)" | rg 'dev\.coinpilot'
 
@@ -199,9 +275,11 @@ done
 ```
 
 현재 미해결 운영 과제는 C2 doctor가 repository source drift와 설치본 runtime
-건전성을 한 오류로 표시하는 점과, 다음 계획된 로그인/재부팅 뒤 launchd
-persistent disable을 다시 실측하는 것이다. 향후 C2 개선 시 immutable 검증을
-약화하거나 기존 C2 계좌를 덮어쓰지 말고 두 상태를 명확히 분리해 표시한다.
+건전성을 한 오류로 표시하는 점, 다음 계획된 로그인/재부팅 뒤 launchd persistent
+disable을 다시 실측하는 것, matching plist가 없는 구형 default label의 enabled
+override 잔재다. 중앙 reporter의 C2 historical intraday DD `N/A`와 드문 Slack
+at-least-once 중복 경계도 유지된다. 향후 C2 개선 시 immutable 검증을 약화하거나
+기존 C2 계좌를 덮어쓰지 말고 두 상태를 명확히 분리해 표시한다.
 
 ## 다음 세션용 복사 프롬프트
 
@@ -224,7 +302,8 @@ LaunchAgent/API/SQLite 상태를 다시 조회해. 현재 관측 결과가 문�
 - 다른 프로젝트가 쓰는 8765를 건드리지 말 것.
 - C2 현재 계정에 install/update를 적용하지 말 것. repo source drift와 실제
   installed runtime 건강 상태를 구분할 것.
-- 사용자가 명시하지 않으면 Slack notifier를 켜지 말 것.
+- 중앙 `dev.coinpilot.daily-scorecard`만 승인됐다. 사용자가 별도로 명시하지 않으면
+  D2/C2 per-instance Slack notifier를 켜지 말 것.
 - 설정상 비활성인 LaunchAgent는 not-loaded뿐 아니라 launchctl persistent
   disabled인지도 확인할 것. loaded/override drift는 즉시 fail-closed할 것.
 
@@ -234,6 +313,10 @@ paper revision·updated_at·ACTIVE 및 설치본 verify-installed 상태를 확�
 현재 알려진 C2 Doctor의 repo-source manifest drift 1건과 추가 오류를 구분해.
 fresh warmup은 stopped가 아니고, C2의 장시간 무체결도 시간봉 특성상 정상일 수
 있어.
+
+중앙 daily-scorecard의 status/doctor, 최신 due receipt, backlog 0, artifact
+checksum도 확인해. 이 reporter의 자가개선은 분석·오프라인 후보 제안까지만이며
+활성 전략·설정·halt·fingerprint·account·ledger를 자동 변경하면 안 돼.
 
 자동 복구는 config·원장 변경이 없고 halt/fingerprint/integrity/position/pending
 문제가 없음을 확인한 현재 인스턴스의 일시적 launchd 프로세스 장애에만 한정해.

@@ -325,9 +325,7 @@ select_python() {
 
   for candidate in \
     "$(command -v python3 2>/dev/null || true)" \
-    "$(command -v python3.12 2>/dev/null || true)" \
-    "/opt/homebrew/bin/python3" \
-    "/usr/local/bin/python3"; do
+    "$(command -v python3.12 2>/dev/null || true)"; do
     if [[ -n "${candidate}" && -x "${candidate}" ]]; then
       if PYTHONDONTWRITEBYTECODE=1 "${candidate}" -c \
           'import sys; raise SystemExit(sys.version_info < (3, 11))' \
@@ -346,7 +344,9 @@ select_python() {
     "${brew_python_prefix:+${brew_python_prefix}/bin/python3.12}" \
     "${brew_python_prefix:+${brew_python_prefix}/libexec/bin/python3}" \
     "/opt/homebrew/bin/python3.12" \
-    "/usr/local/bin/python3.12"; do
+    "/usr/local/bin/python3.12" \
+    "/opt/homebrew/bin/python3" \
+    "/usr/local/bin/python3"; do
     if [[ -n "${candidate}" && -x "${candidate}" ]]; then
       if PYTHONDONTWRITEBYTECODE=1 "${candidate}" -c \
           'import sys; raise SystemExit(sys.version_info < (3, 11))' \

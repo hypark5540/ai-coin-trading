@@ -246,6 +246,13 @@ if [[ "${1:-}" == "--version" ]]; then
 fi
 exit 1
 SH
+cat > "${PYTHON_DETECTION_BIN}/python3.12" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "--version" ]]; then
+  echo "Python 3.9.6"
+fi
+exit 1
+SH
 cat > "${PYTHON_DETECTION_BIN}/brew" <<'SH'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "--prefix" && "${2:-}" == "python@3.12" ]]; then
@@ -267,6 +274,7 @@ exit 1
 SH
 chmod 755 \
   "${PYTHON_DETECTION_BIN}/python3" \
+  "${PYTHON_DETECTION_BIN}/python3.12" \
   "${PYTHON_DETECTION_BIN}/brew" \
   "${PYTHON_FORMULA_PREFIX}/bin/python3.12"
 PATH="${PYTHON_DETECTION_BIN}:/usr/bin:/bin" \

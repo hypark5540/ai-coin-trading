@@ -109,6 +109,10 @@ class _NoRunStore:
         self.markets.append(market)
         return None
 
+    def read_latest_feed_anchor(self, market):
+        self.markets.append(market)
+        return None
+
 
 class _DashboardContractParser(HTMLParser):
     """Collect structural and resource-loading contracts without pinning layout."""
@@ -422,6 +426,76 @@ def test_status_and_watchdog_do_not_fallback_to_another_market() -> None:
     )
     assert result == {"status": "no_run", "alert_enqueued": False}
     assert store.markets == ["KRW-ETH", "KRW-ETH"]
+
+
+def test_watchdog_uses_only_the_lightweight_feed_anchor_lookup() -> None:
+    class Store:
+        def __init__(self) -> None:
+            self.markets: list[str] = []
+
+        def read_latest_feed_anchor(self, market):
+            self.markets.append(market)
+            return {
+                "run_id": "latest-run",
+                "started_wall_ns": 1_000_000_000,
+                "last_book_wall_ns": 99_000_000_000,
+            }
+
+        def latest_run_id(self, market):
+            raise AssertionError("watchdog must use one anchor lookup")
+
+        def read_status(self, run_id):
+            raise AssertionError("watchdog must not build full status")
+
+    store = Store()
+    result = run_watchdog(
+        store,
+        market="KRW-BTC",
+        stale_after_seconds=60,
+        now_wall_ns=100_000_000_000,
+    )
+
+    assert result == {
+        "status": "ok",
+        "feed_age_seconds": 1.0,
+        "alert_enqueued": False,
+    }
+    assert store.markets == ["KRW-BTC"]
+
+
+def test_watchdog_stale_alert_remains_idempotent_with_anchor_lookup(
+    tmp_path,
+) -> None:
+    store = ShadowStore(tmp_path / "shadow.db")
+    engine, _ = ShadowEngine.start(
+        store,
+        ShadowConfig(market="KRW-BTC"),
+        run_id="watchdog-run",
+        started_wall_ns=1_000_000_000,
+    )
+
+    first = run_watchdog(
+        store,
+        market="KRW-BTC",
+        stale_after_seconds=60,
+        now_wall_ns=100_000_000_000,
+    )
+    second = run_watchdog(
+        store,
+        market="KRW-BTC",
+        stale_after_seconds=60,
+        now_wall_ns=101_000_000_000,
+    )
+
+    assert first["status"] == "critical"
+    assert second["status"] == "critical"
+    stale = [
+        row
+        for row in store.pending_notifications(run_id=engine.run_id)
+        if row["topic"] == "shadow_feed_stale"
+    ]
+    assert len(stale) == 1
+    assert stale[0]["payload"]["last_feed_wall_ns"] == 1_000_000_000
 
 
 def test_local_status_server_has_no_mutation_endpoint() -> None:

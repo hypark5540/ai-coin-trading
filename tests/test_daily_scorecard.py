@@ -131,6 +131,9 @@ def _d2_database(
           last_book_monotonic_ns INTEGER, last_book_wall_ns INTEGER,
           halt_reason TEXT, updated_wall_ns INTEGER
         );
+        CREATE TABLE shadow_decisions (
+          decision_id TEXT PRIMARY KEY, run_id TEXT
+        );
         CREATE TABLE shadow_orders (
           order_id TEXT PRIMARY KEY, run_id TEXT, status TEXT
         );
@@ -149,7 +152,7 @@ def _d2_database(
         );
         CREATE TABLE notification_outbox (
           notification_id TEXT PRIMARY KEY, run_id TEXT, topic TEXT,
-          severity TEXT, created_wall_ns INTEGER
+          severity TEXT, status TEXT, created_wall_ns INTEGER
         );
         """
     )
@@ -316,6 +319,98 @@ stale_after_seconds = 60
         config_hash=config_hash,
         code_version=code_version,
     )
+
+
+def _set_d2_observe_profile(root: Path, instance: str) -> Path:
+    home = root / "instances" / instance
+    config_path = home / "config/config.toml"
+    runtime_path = home / "config/runtime.env"
+    config_text = config_path.read_text(encoding="utf-8")
+    config_text = config_text.replace(
+        'mode = "diagnostic"',
+        'mode = "observe"',
+        1,
+    ).replace(
+        'model_version = "diagnostic-bounded-v1"',
+        'model_version = "observe-public-feed-v1"',
+        1,
+    )
+    _write(config_path, config_text)
+    _write(
+        runtime_path,
+        runtime_path.read_text(encoding="utf-8").replace(
+            "COINPILOT_BOUNDED_SHADOW=1",
+            "COINPILOT_BOUNDED_SHADOW=0",
+        ),
+    )
+
+    database = home / "data/shadow-diagnostic-bounded-v1-test.db"
+    connection = sqlite3.connect(database)
+    stored_config = json.loads(
+        connection.execute(
+            "SELECT config_json FROM shadow_runs WHERE run_id = 'run-1'"
+        ).fetchone()[0]
+    )
+    config_hash = hashlib.sha256(
+        _canonical_json(stored_config).encode("utf-8")
+    ).hexdigest()
+    code_version = "shadow-deployment-v1:observe-without-environment-override"
+    connection.execute("DELETE FROM shadow_decisions")
+    connection.execute("DELETE FROM shadow_orders")
+    connection.execute("DELETE FROM shadow_fills")
+    connection.execute(
+        """
+        UPDATE shadow_state
+        SET cash_quote = 1000, base_quantity = 0, average_cost_quote = 0,
+            realized_pnl_quote = 0, cumulative_fees_quote = 0,
+            last_equity_quote = 1000, peak_equity_quote = 1000,
+            max_drawdown = 0
+        WHERE run_id = 'run-1'
+        """
+    )
+    connection.execute(
+        """
+        UPDATE shadow_equity
+        SET equity_quote = 1000, cash_quote = 1000,
+            base_quantity = 0, drawdown = 0
+        WHERE run_id = 'run-1'
+        """
+    )
+    connection.execute(
+        """
+        UPDATE shadow_runs
+        SET config_hash = ?, config_json = ?, code_version = ?
+        WHERE run_id = 'run-1'
+        """,
+        (config_hash, _canonical_json(stored_config), code_version),
+    )
+    connection.commit()
+    connection.close()
+
+    installed_identity = _canonical_json(
+        {
+            "config": stored_config,
+            "config_hash": config_hash,
+            "code_version": code_version,
+        }
+    )
+    wrong_identity = _canonical_json(
+        {
+            "config": stored_config,
+            "config_hash": config_hash,
+            "code_version": "wrong-bounded-environment-override",
+        }
+    )
+    _write_executable(
+        home / "venv/bin/python",
+        "#!/bin/sh\n"
+        "if [ -n \"${COINPILOT_CODE_VERSION:-}\" ]; then\n"
+        f"  printf '%s\\n' '{wrong_identity}'\n"
+        "else\n"
+        f"  printf '%s\\n' '{installed_identity}'\n"
+        "fi\n",
+    )
+    return database
 
 
 def _c2_database(
@@ -665,6 +760,203 @@ def test_build_scorecard_reads_only_allowlisted_ledgers_and_reconciles(
     )
     assert report["source_policy"]["legacy_instances_excluded"] == ["btc", "eth", "xrp", "sol"]
     assert report["source_policy"]["d2_and_c2_returns_combined"] is False
+    assert all(
+        row["runtime_profile"] == "bounded_diagnostic"
+        and row["strategy_role"] == "bounded_diagnostic_not_validated_alpha"
+        and row["safety"]["bounded_profile"] is True
+        and row["safety"]["observe_profile"] is False
+        and row["safety"]["simulation_contract_source"]
+        == "installed_bounded_runtime_identity"
+        for row in report["D2"]["instances"]
+    )
+
+
+def test_d2_approved_observe_profile_uses_unoverridden_installed_identity(
+    reporting_root,
+) -> None:
+    root, window, generated_ns = reporting_root
+    _set_d2_observe_profile(root, "d2-btc")
+
+    report = build_scorecard(
+        root=root,
+        window=window,
+        generated_wall_ns=generated_ns,
+    )
+    row = report["D2"]["instances"][0]
+
+    assert report["safety"]["verified"] is True
+    assert row["runtime_profile"] == "public_feed_observe"
+    assert row["strategy_role"] == "public_feed_observation_no_orders"
+    assert row["operations"]["decision_count"] == 0
+    assert row["operations"]["fill_count"] == 0
+    assert row["current"]["pending_orders"] == 0
+    assert row["safety"]["bounded_profile"] is False
+    assert row["safety"]["observe_profile"] is True
+    assert row["safety"]["observe_zero_activity"] is True
+    assert row["safety"]["installed_code_fingerprint"] is True
+    assert row["safety"]["simulation_contract_source"] == (
+        "installed_observe_runtime_identity"
+    )
+    assert row["safety"]["verified"] is True
+    markdown = scorecard_markdown(report)
+    assert "D2 approved shadow profiles" in markdown
+    assert "current active ledger" in markdown
+    assert "자동 합산하지 않습니다" in markdown
+
+
+def test_d2_observe_only_improvement_uses_observation_quality_not_pnl(
+    reporting_root,
+) -> None:
+    root, window, generated_ns = reporting_root
+    for instance in ("d2-btc", "d2-eth", "d2-xrp", "d2-sol"):
+        _set_d2_observe_profile(root, instance)
+
+    report = build_scorecard(
+        root=root,
+        window=window,
+        generated_wall_ns=generated_ns,
+    )
+    observations = report["improvement"]["observations"]
+
+    assert report["safety"]["verified"] is True
+    assert any(
+        "D2 observe 활성 원장은 주문 없는 공개피드 관찰 구간" in item
+        for item in observations
+    )
+    assert not any(item.startswith("D2 회계 실현손익") for item in observations)
+    assert not any(item.startswith("D2 최근 7일") for item in observations)
+    assert not any("D2 누적 수수료" in item for item in observations)
+
+
+@pytest.mark.parametrize("activity", ["decision", "fill", "pending_order"])
+def test_d2_observe_profile_fails_closed_on_order_activity(
+    reporting_root,
+    activity: str,
+) -> None:
+    root, window, generated_ns = reporting_root
+    database = _set_d2_observe_profile(root, "d2-btc")
+    connection = sqlite3.connect(database)
+    if activity == "decision":
+        connection.execute(
+            "INSERT INTO shadow_decisions VALUES ('unexpected', 'run-1')"
+        )
+    elif activity == "fill":
+        connection.execute(
+            "INSERT INTO shadow_fills VALUES ('unexpected', 'run-1', ?, 'buy', 1, 100, 0.05)",
+            (window.start_wall_ns + 1,),
+        )
+    else:
+        connection.execute(
+            "INSERT INTO shadow_orders VALUES ('unexpected', 'run-1', 'pending')"
+        )
+    connection.commit()
+    connection.close()
+
+    report = build_scorecard(
+        root=root,
+        window=window,
+        generated_wall_ns=generated_ns,
+    )
+    row = report["D2"]["instances"][0]
+
+    assert row["available"] is True
+    assert row["safety"]["observe_profile"] is True
+    assert row["safety"]["observe_zero_activity"] is False
+    assert row["safety"]["simulation_contract"] is False
+    assert row["safety"]["verified"] is False
+    assert report["safety"]["verified"] is False
+
+
+def test_d2_observe_profile_requires_exact_model_and_runtime_flags(
+    reporting_root,
+) -> None:
+    root, window, generated_ns = reporting_root
+    _set_d2_observe_profile(root, "d2-btc")
+    config_path = root / "instances/d2-btc/config/config.toml"
+    _write(
+        config_path,
+        config_path.read_text(encoding="utf-8").replace(
+            'model_version = "observe-public-feed-v1"',
+            'model_version = "observe-public-feed-v2"',
+        ),
+    )
+
+    report = build_scorecard(
+        root=root,
+        window=window,
+        generated_wall_ns=generated_ns,
+    )
+    row = report["D2"]["instances"][0]
+
+    assert row["runtime_profile"] == "unapproved"
+    assert row["safety"]["approved_profile"] is False
+    assert row["safety"]["simulation_contract"] is False
+    assert row["safety"]["verified"] is False
+
+
+def test_d2_pending_audit_backlog_is_reported_without_notifier_failure(
+    reporting_root,
+) -> None:
+    root, window, generated_ns = reporting_root
+    database = (
+        root / "instances/d2-btc/data/shadow-diagnostic-bounded-v1-test.db"
+    )
+    connection = sqlite3.connect(database)
+    connection.executemany(
+        "INSERT INTO notification_outbox VALUES (?, 'run-1', ?, ?, ?, ?)",
+        [
+            (
+                "pending-warning",
+                "shadow_feed_continuity",
+                "warning",
+                "pending",
+                generated_ns - 7200 * 1_000_000_000,
+            ),
+            (
+                "pending-critical",
+                "shadow_halted",
+                "critical",
+                "pending",
+                generated_ns - 3600 * 1_000_000_000,
+            ),
+            (
+                "sending-warning",
+                "shadow_restart_recovery",
+                "warning",
+                "sending",
+                generated_ns - 1800 * 1_000_000_000,
+            ),
+            (
+                "delivered-warning",
+                "shadow_restart_recovery",
+                "warning",
+                "delivered",
+                generated_ns - 10_800 * 1_000_000_000,
+            ),
+        ],
+    )
+    connection.commit()
+    connection.close()
+
+    report = build_scorecard(
+        root=root,
+        window=window,
+        generated_wall_ns=generated_ns,
+    )
+    row = report["D2"]["instances"][0]
+    operations = row["operations"]
+
+    assert report["safety"]["verified"] is True
+    assert operations["pending_outbox"] == 3
+    assert operations["pending_warning"] == 2
+    assert operations["pending_critical"] == 1
+    assert operations["oldest_pending_age_seconds"] == pytest.approx(7200.0)
+    markdown = scorecard_markdown(report)
+    message = json.dumps(slack_message(report), ensure_ascii=False)
+    for rendered in (markdown, message):
+        assert "audit unresolved/warn/crit 3/2/1, oldest 7200s" in rendered
+        assert "notifier OFF" in rendered
+        assert "관찰 품질" in rendered
 
 
 def test_c2_archived_accounts_are_counted_but_excluded(reporting_root) -> None:

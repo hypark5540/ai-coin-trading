@@ -569,6 +569,8 @@ def _d2_installed_identity(
     instance_home: Path,
     config_path: Path,
     runtime: Mapping[str, str],
+    *,
+    bounded_deployment: bool,
 ) -> dict[str, Any]:
     interpreter = instance_home / "venv" / "bin" / "python"
     service_wrapper = instance_home / "bin" / "coinpilot-service"
@@ -604,9 +606,14 @@ print(json.dumps({
     "code_version": shadow_deployment_version(config),
 }, sort_keys=True))
 """
+    environment = (
+        {"COINPILOT_CODE_VERSION": deployment_label}
+        if bounded_deployment
+        else None
+    )
     return _run_json_identity(
         (str(interpreter), "-c", program, str(config_path)),
-        environment={"COINPILOT_CODE_VERSION": deployment_label},
+        environment=environment,
         cwd=instance_home,
     )
 
@@ -877,10 +884,26 @@ def _aggregate_d2(
         and runtime.get("COINPILOT_ENABLE_PAPER") == "0"
         and runtime.get("COINPILOT_ENABLE_NOTIFIER") == "0"
     )
+    observe_ok = (
+        shadow.get("mode") == "observe"
+        and shadow.get("model_version") == "observe-public-feed-v1"
+        and runtime.get("COINPILOT_BOUNDED_SHADOW") == "0"
+        and runtime.get("COINPILOT_ENABLE_SHADOW") == "1"
+        and runtime.get("COINPILOT_ENABLE_PAPER") == "0"
+        and runtime.get("COINPILOT_ENABLE_NOTIFIER") == "0"
+    )
+    runtime_profile = (
+        "bounded_diagnostic"
+        if bounded_ok
+        else "public_feed_observe"
+        if observe_ok
+        else "unapproved"
+    )
     installed_identity = _d2_installed_identity(
         instance_home,
         config_path,
         runtime,
+        bounded_deployment=(runtime.get("COINPILOT_BOUNDED_SHADOW") == "1"),
     )
 
     connection = open_readonly_sqlite(database_path)
@@ -888,6 +911,7 @@ def _aggregate_d2(
         expected_tables = {
             "shadow_runs",
             "shadow_state",
+            "shadow_decisions",
             "shadow_orders",
             "shadow_fills",
             "shadow_equity",
@@ -949,6 +973,15 @@ def _aggregate_d2(
         )
         current_replay = _trade_replay(fills, end_wall_ns=replay_end)
         equity = _d2_equity_metrics(connection, lineage_run_ids, window)
+        decision_count = int(
+            connection.execute(
+                f"""
+                SELECT COUNT(*) FROM shadow_decisions
+                WHERE run_id IN ({placeholders})
+                """,
+                lineage_run_ids,
+            ).fetchone()[0]
+        )
         pending_orders = int(
             connection.execute(
                 f"""
@@ -990,6 +1023,19 @@ def _aggregate_d2(
                 window.end_wall_ns,
             ),
         ).fetchone()
+        pending_outbox = connection.execute(
+            f"""
+            SELECT
+              COUNT(*) AS pending,
+              COALESCE(SUM(severity = 'warning'), 0) AS warnings,
+              COALESCE(SUM(severity = 'critical'), 0) AS criticals,
+              MIN(created_wall_ns) AS oldest_created_wall_ns
+            FROM notification_outbox AS n
+            WHERE (n.run_id IN ({placeholders}) OR n.run_id IS NULL)
+              AND n.status IN ('pending', 'sending')
+            """,
+            lineage_run_ids,
+        ).fetchone()
     finally:
         connection.close()
 
@@ -1010,8 +1056,19 @@ def _aggregate_d2(
     code_identity_ok = str(latest["code_version"]) == installed_identity.get(
         "code_version"
     )
+    observe_zero_activity = (
+        decision_count == 0 and len(fills) == 0 and pending_orders == 0
+    )
+    profile_activity_ok = (
+        True
+        if bounded_ok
+        else observe_zero_activity
+        if observe_ok
+        else False
+    )
     simulation_contract_ok = (
-        bounded_ok
+        (bounded_ok or observe_ok)
+        and profile_activity_ok
         and config_identity_ok
         and code_identity_ok
         and _optional_bool_matches(health_details, "simulated", True)
@@ -1102,11 +1159,36 @@ def _aggregate_d2(
         and fresh
     )
     ready = alive_ok and latest["lifecycle_status"] == "running"
+    oldest_pending_wall_ns = pending_outbox["oldest_created_wall_ns"]
+    oldest_pending_age_seconds = (
+        None
+        if oldest_pending_wall_ns is None
+        else max(
+            0.0,
+            (generated_wall_ns - int(oldest_pending_wall_ns)) / NANOSECONDS,
+        )
+    )
+    strategy_role = (
+        "bounded_diagnostic_not_validated_alpha"
+        if bounded_ok
+        else "public_feed_observation_no_orders"
+        if observe_ok
+        else "unapproved_shadow_profile"
+    )
+    simulation_contract_source = (
+        "installed_bounded_runtime_identity"
+        if bounded_ok
+        else "installed_observe_runtime_identity"
+        if observe_ok
+        else "unapproved_d2_runtime_profile"
+    )
     return {
         "instance": instance,
         "family": "D2",
         "market": expected_market,
-        "strategy_role": "bounded_diagnostic_not_validated_alpha",
+        "strategy_role": strategy_role,
+        "runtime_profile": runtime_profile,
+        "metrics_scope": "current_active_ledger_restart_lineage_only",
         "source_database": str(database_path),
         "database_health": database_health,
         "metrics": metrics,
@@ -1149,6 +1231,12 @@ def _aggregate_d2(
             "continuity_events": int(operational["continuity"] or 0),
             "halt_events": int(operational["halts"] or 0),
             "recovery_events": int(operational["recoveries"] or 0),
+            "decision_count": decision_count,
+            "fill_count": len(fills),
+            "pending_outbox": int(pending_outbox["pending"] or 0),
+            "pending_warning": int(pending_outbox["warnings"] or 0),
+            "pending_critical": int(pending_outbox["criticals"] or 0),
+            "oldest_pending_age_seconds": oldest_pending_age_seconds,
         },
         "reconciliation": {
             "state_vs_fill_realized_pnl_error_quote": realized_error,
@@ -1170,8 +1258,13 @@ def _aggregate_d2(
             "live_order_routing": health_details.get("live_order_routing"),
             "orders_sent": health_details.get("orders_sent"),
             "bounded_profile": bounded_ok,
+            "observe_profile": observe_ok,
+            "approved_profile": bounded_ok or observe_ok,
+            "observe_zero_activity": (
+                observe_zero_activity if observe_ok else None
+            ),
             "simulation_contract": simulation_contract_ok,
-            "simulation_contract_source": "installed_bounded_runtime_identity",
+            "simulation_contract_source": simulation_contract_source,
             "current_config_fingerprint": config_identity_ok,
             "installed_code_fingerprint": code_identity_ok,
             "risk_boundary_fail_closed": risk_boundary_ok,
@@ -1806,6 +1899,11 @@ def _improvement_assessment(
     window: ReportWindow,
 ) -> dict[str, Any]:
     all_rows = [*d2, *c2]
+    d2_observe_only = bool(d2) and all(
+        row.get("available")
+        and row.get("strategy_role") == "public_feed_observation_no_orders"
+        for row in d2
+    )
     safety_ok = all(
         row.get("available") and row.get("safety", {}).get("verified")
         for row in all_rows
@@ -1826,6 +1924,25 @@ def _improvement_assessment(
     elif int(c2_trades) < 30:
         observations.append(f"C2 누적 완료 거래가 {int(c2_trades)}건으로 매우 적습니다.")
     for family_name, rows in (("D2", d2), ("C2", c2)):
+        if family_name == "D2" and d2_observe_only:
+            decisions = sum(
+                int(row.get("operations", {}).get("decision_count", 0))
+                for row in rows
+            )
+            fills = sum(
+                int(row.get("operations", {}).get("fill_count", 0))
+                for row in rows
+            )
+            unresolved = sum(
+                int(row.get("operations", {}).get("pending_outbox", 0))
+                for row in rows
+            )
+            observations.append(
+                "D2 observe 활성 원장은 주문 없는 공개피드 관찰 구간이며 "
+                f"결정 {decisions}건, 체결 {fills}건, audit unresolved "
+                f"{unresolved}건입니다."
+            )
+            continue
         daily = _sum_metric(rows, "daily", "realized_pnl_quote")
         previous = _sum_metric(rows, "previous_day", "realized_pnl_quote")
         trailing = _sum_metric(rows, "trailing_7d", "realized_pnl_quote")
@@ -1863,11 +1980,11 @@ def _improvement_assessment(
         if row.get("available")
         and row.get("equity", {}).get("sampled_daily_drawdown") is not None
     ]
-    if d2_drawdowns:
+    if d2_drawdowns and not d2_observe_only:
         observations.append(f"D2 최대 일중 sampled DD는 {max(d2_drawdowns):.3%}입니다.")
     d2_fees = _sum_metric(d2, "lineage", "fees_quote")
     d2_pnl = _sum_metric(d2, "lineage", "realized_pnl_quote")
-    if d2_fees is not None and d2_pnl is not None:
+    if d2_fees is not None and d2_pnl is not None and not d2_observe_only:
         observations.append(
             f"D2 누적 수수료 {float(d2_fees):.2f}원, 순실현손익 {float(d2_pnl):.2f}원은 배관 진단 관측치입니다."
         )
@@ -1996,6 +2113,8 @@ def build_scorecard(
             "source_database_access": "sqlite_mode_ro_query_only_single_read_transaction",
             "trading_outbox_mutation": False,
             "d2_and_c2_returns_combined": False,
+            "d2_active_ledger_only": True,
+            "d2_historical_ledger_auto_aggregation": False,
         },
         "D2": {"summary": d2_summary, "instances": d2},
         "C2": {"summary": c2_summary, "instances": c2},
@@ -2014,7 +2133,17 @@ def build_scorecard(
         },
         "improvement": improvement,
         "caveats": [
-            "D2 is a bounded diagnostic, not validated alpha.",
+            (
+                "D2 is a bounded diagnostic, not validated alpha."
+                if all(
+                    row.get("strategy_role")
+                    == "bounded_diagnostic_not_validated_alpha"
+                    for row in d2
+                    if row.get("available")
+                )
+                else "D2 observe is public-feed observation with no decisions, orders, or fills."
+            ),
+            "D2 metrics cover only the current active ledger restart lineage; prior diagnostic terminal results remain in the transition receipt and frozen ledger and are never auto-aggregated.",
             "C2 historical intraday max drawdown is unavailable because the paper ledger has no equity history.",
             "A non-flat C2 boundary valuation is a labeled closed-candle liquidation estimate.",
             "Repository-source C2 manifest drift is excluded; the installed frozen package manifest controls runtime verification.",
@@ -2071,6 +2200,32 @@ def _c2_equity_coverage(row: Mapping[str, Any]) -> str:
     return "estimated"
 
 
+def _d2_section_title(instances: Sequence[Mapping[str, Any]]) -> str:
+    roles = {
+        str(row.get("strategy_role"))
+        for row in instances
+        if row.get("available")
+    }
+    if roles == {"bounded_diagnostic_not_validated_alpha"}:
+        return "D2 bounded diagnostic"
+    if roles == {"public_feed_observation_no_orders"}:
+        return "D2 public-feed observe"
+    return "D2 approved shadow profiles"
+
+
+def _d2_audit_backlog_text(row: Mapping[str, Any]) -> str:
+    operations = row.get("operations", {})
+    if "pending_outbox" not in operations:
+        return ""
+    oldest = operations.get("oldest_pending_age_seconds")
+    oldest_text = "N/A" if oldest is None else f"{float(oldest):.0f}s"
+    return (
+        f"audit unresolved/warn/crit {operations.get('pending_outbox', 0)}/"
+        f"{operations.get('pending_warning', 0)}/"
+        f"{operations.get('pending_critical', 0)}, oldest {oldest_text}"
+    )
+
+
 def _compact_instance_line(row: Mapping[str, Any]) -> str:
     market = str(row.get("market", "?"))
     if not row.get("available"):
@@ -2100,6 +2255,9 @@ def _compact_instance_line(row: Mapping[str, Any]) -> str:
             f"cont/halt/recover {operations.get('continuity_events', 0)}/"
             f"{operations.get('halt_events', 0)}/{operations.get('recovery_events', 0)}"
         )
+        audit_backlog = _d2_audit_backlog_text(row)
+        if audit_backlog:
+            ops_text += f" · {audit_backlog}"
     else:
         drawdown = "N/A"
         period_return = _percent(row.get("equity", {}).get("return"), signed=True)
@@ -2122,6 +2280,11 @@ def scorecard_markdown(report: Mapping[str, Any]) -> str:
     safety = report["safety"]
     d2 = report["D2"]
     c2 = report["C2"]
+    d2_title = _d2_section_title(d2["instances"])
+    has_d2_profile_contract = any(
+        row.get("available") and "runtime_profile" in row
+        for row in d2["instances"]
+    )
     lines = [
         f"# CoinPilot 일일 모의거래 성적표 — {report['report_date']}",
         "",
@@ -2137,7 +2300,7 @@ def scorecard_markdown(report: Mapping[str, Any]) -> str:
             )
         ),
         "",
-        "## D2 bounded diagnostic",
+        f"## {d2_title}",
         "",
         (
             f"일 회계 실현손익 {_krw(d2['summary']['daily']['realized_pnl_quote'], signed=True)}, "
@@ -2170,7 +2333,16 @@ def scorecard_markdown(report: Mapping[str, Any]) -> str:
                 position=("flat" if abs(float(row["current"]["base_quantity"])) <= POSITION_EPSILON else f"{float(row['current']['base_quantity']):.8g}"),
                 equity=_krw(row["current"]["equity_quote"]),
                 fresh=f"{float(row['current']['feed_age_seconds']):.0f}s" if row["current"]["feed_age_seconds"] is not None else "N/A",
-                ops=f"cont/halt/recover {row['operations']['continuity_events']}/{row['operations']['halt_events']}/{row['operations']['recovery_events']}",
+                ops=(
+                    f"cont/halt/recover {row['operations']['continuity_events']}/"
+                    f"{row['operations']['halt_events']}/"
+                    f"{row['operations']['recovery_events']}"
+                    + (
+                        f"; {_d2_audit_backlog_text(row)}"
+                        if _d2_audit_backlog_text(row)
+                        else ""
+                    )
+                ),
                 recon="PASS" if row["reconciliation"]["ok"] else "FAIL",
                 status=row["current"]["lifecycle_status"],
             )
@@ -2178,7 +2350,24 @@ def scorecard_markdown(report: Mapping[str, Any]) -> str:
     lines.extend(
         [
             "",
-            "D2 수치는 알파 성과가 아니라 체결·비용·회계 배관 진단 관측치입니다.",
+            (
+                "D2 수치는 알파 성과가 아니라 체결·비용·회계 배관 진단 관측치입니다."
+                if d2_title == "D2 bounded diagnostic"
+                else "D2 observe는 공개피드 관찰 전용이며 결정·주문·체결을 생성하지 않습니다."
+                if d2_title == "D2 public-feed observe"
+                else "D2 행별 strategy_role에 따라 bounded diagnostic과 주문 없는 공개피드 observe를 구분합니다."
+            ),
+        ]
+    )
+    if has_d2_profile_contract:
+        lines.extend(
+            [
+                "D2 지표는 current active ledger only입니다. 이전 diagnostic terminal 성과는 transition receipt와 동결 원장에 보존하며 자동 합산하지 않습니다.",
+                "D2 per-instance notifier OFF는 승인 profile의 정상 조건입니다. audit pending backlog는 관찰 품질이며 notifier 장애 판정이 아닙니다.",
+            ]
+        )
+    lines.extend(
+        [
             "",
             "## C2 forward paper",
             "",
@@ -2250,6 +2439,12 @@ def slack_message(report: Mapping[str, Any]) -> dict[str, Any]:
     safety_ok = bool(report["safety"]["verified"])
     d2 = report["D2"]
     c2 = report["C2"]
+    d2_title = _d2_section_title(d2["instances"])
+    has_d2_profile_contract = any(
+        row.get("available") and "runtime_profile" in row
+        for row in d2["instances"]
+    )
+    d2_summary_title = d2_title if has_d2_profile_contract else "D2 진단"
     icon = "📊" if safety_ok else "⚠️"
     safety_text = (
         "✅ PASS · `simulated=true` · `own_execution=false` · `live_order_routing=false` · `orders_sent=0`"
@@ -2289,7 +2484,7 @@ def slack_message(report: Mapping[str, Any]) -> dict[str, Any]:
                 {
                     "type": "mrkdwn",
                     "text": (
-                        "*D2 진단 · 일 회계 실현*\n"
+                        f"*{d2_summary_title} · 일 회계 실현*\n"
                         f"{_krw(d2['summary']['daily']['realized_pnl_quote'], signed=True)} · "
                         f"RT {d2['summary']['daily']['completed_trades']} · "
                         f"fee {_krw(d2['summary']['daily']['fees_quote'])}"
@@ -2308,7 +2503,7 @@ def slack_message(report: Mapping[str, Any]) -> dict[str, Any]:
         },
         {
             "type": "section",
-            "text": {"type": "mrkdwn", "text": f"*D2 bounded diagnostic*\n{d2_lines}"},
+            "text": {"type": "mrkdwn", "text": f"*{d2_title}*\n{d2_lines}"},
         },
         {
             "type": "section",
@@ -2344,8 +2539,14 @@ def slack_message(report: Mapping[str, Any]) -> dict[str, Any]:
                 {
                     "type": "mrkdwn",
                     "text": (
-                        "D2는 alpha가 아닌 배관 진단 · C2 non-flat MTM은 별도 추정치 · "
-                        "자동 전략 변경/rearm 없음 · 상세 JSON/Markdown은 로컬 감사 보존"
+                        "D2는 alpha가 아닌 진단/공개피드 관찰 · C2 non-flat MTM은 별도 추정치 · "
+                        + (
+                            "D2 notifier OFF는 정상, audit unresolved는 관찰 품질 · "
+                            "D2 current active ledger only, 과거 원장 자동 합산 없음 · "
+                            if has_d2_profile_contract
+                            else ""
+                        )
+                        + "자동 전략 변경/rearm 없음 · 상세 JSON/Markdown은 로컬 감사 보존"
                     ),
                 }
             ],

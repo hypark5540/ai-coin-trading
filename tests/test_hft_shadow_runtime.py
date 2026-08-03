@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from coinpilot import hft_shadow_store as shadow_store_module
 from coinpilot.hft_depth import PublicOrderBook
 from coinpilot.hft_shadow import (
     LIVE_ORDER_ROUTING_SUPPORTED,
@@ -91,6 +92,93 @@ def _row(path: Path, query: str, parameters: tuple[object, ...] = ()) -> sqlite3
         connection.close()
     assert selected is not None
     return selected
+
+
+def test_latest_health_is_deterministic_and_query_is_not_correlated(
+    tmp_path: Path,
+) -> None:
+    store, engine = _engine(tmp_path)
+    observed_wall_ns = WALL_BASE + 100
+    store.update_heartbeat(
+        run_id=engine.run_id,
+        component="market_feed",
+        status="ok",
+        observed_wall_ns=observed_wall_ns,
+        event_key="first-at-same-time",
+        details={"marker": "first"},
+    )
+    store.update_heartbeat(
+        run_id=engine.run_id,
+        component="market_feed",
+        status="degraded",
+        observed_wall_ns=observed_wall_ns,
+        event_key="second-at-same-time",
+        details={"marker": "second"},
+        alert_on_unhealthy=False,
+    )
+    store.update_heartbeat(
+        run_id=engine.run_id,
+        component="shadow_engine",
+        status="ok",
+        observed_wall_ns=observed_wall_ns - 1,
+        event_key="engine",
+        details={"marker": "engine"},
+    )
+
+    expected = [
+        {
+            "component": "market_feed",
+            "status": "degraded",
+            "observed_wall_ns": observed_wall_ns,
+            "details": {"marker": "second"},
+        },
+        {
+            "component": "shadow_engine",
+            "status": "ok",
+            "observed_wall_ns": observed_wall_ns - 1,
+            "details": {"marker": "engine"},
+        },
+    ]
+    assert store.read_health(engine.run_id) == expected
+    assert store.read_status(engine.run_id)["health"] == expected
+
+    with sqlite3.connect(store.path) as connection:
+        plan_rows = connection.execute(
+            "EXPLAIN QUERY PLAN " + shadow_store_module._LATEST_HEALTH_SQL,
+            (engine.run_id, engine.run_id),
+        ).fetchall()
+    plan = "\n".join(str(row[3]) for row in plan_rows)
+    assert "CORRELATED" not in plan.upper()
+    assert "idx_shadow_health_run_component" in plan
+
+
+def test_watchdog_lookup_and_outbox_status_index_are_bounded(
+    tmp_path: Path,
+) -> None:
+    store, engine = _engine(tmp_path, started_wall_ns=WALL_BASE - 1_000)
+    assert store.read_latest_feed_anchor("krw-btc") == {
+        "run_id": engine.run_id,
+        "started_wall_ns": WALL_BASE - 1_000,
+        "last_book_wall_ns": None,
+    }
+    assert store.read_latest_feed_anchor("KRW-ETH") is None
+
+    with sqlite3.connect(store.path) as connection:
+        index_columns = {
+            row[1]: tuple(
+                column[2]
+                for column in connection.execute(
+                    f"PRAGMA index_info({row[1]})"
+                ).fetchall()
+            )
+            for row in connection.execute(
+                "PRAGMA index_list(notification_outbox)"
+            ).fetchall()
+        }
+    assert index_columns["idx_notification_outbox_run_status"] == (
+        "run_id",
+        "status",
+    )
 
 
 def test_shadow_only_wal_partial_latency_and_idempotency(tmp_path: Path) -> None:

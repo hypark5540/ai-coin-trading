@@ -118,6 +118,14 @@ grep -Fq 'invalid COINPILOT_BOUNDED_SHADOW value' \
 grep -Fq 'coinpilot-bounded-shadow' "${REPO_ROOT}/scripts/mac-studio"
 echo "OK bounded diagnostic profile fails closed"
 
+[[ -x "${REPO_ROOT}/scripts/manage_d2_observe_transition.py" ]]
+grep -Fq 'transition-observe)' "${REPO_ROOT}/scripts/mac-studio"
+grep -Fq "stop every \${INSTANCE} LaunchAgent before transition-observe" \
+  "${REPO_ROOT}/scripts/mac-studio"
+grep -Fq 'scripts/manage_d2_observe_transition.py' \
+  "${REPO_ROOT}/scripts/mac-studio"
+echo "OK D2 observe transition is explicit and requires stopped services"
+
 grep -Fq 'COINPILOT_ENABLE_PAPER' "${REPO_ROOT}/scripts/mac-studio"
 grep -Fq 'paper --loop' "${REPO_ROOT}/scripts/coinpilot-service.sh"
 grep -Fq 'coinpilot-c2.db' "${REPO_ROOT}/scripts/mac-studio-backup"

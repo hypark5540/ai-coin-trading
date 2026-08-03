@@ -86,7 +86,7 @@
   },
   "schema_version": 1,
   "source_tree": {
-    "aggregate_sha256": "23b253e19b595fe0f9f94e0fe03b517a732b852fbd0ffc307d9788dd97900b82",
+    "aggregate_sha256": "2ad65484ccfe472e98f3cb94f44f19ac75c7e70fbd30a6ff868a694c68eb8a04",
     "file_count": 33,
     "scope": "pyproject.toml + sorted src/coinpilot/**/*.py"
   },

@@ -22,6 +22,8 @@ INITIAL_CASH_OVERRIDE=""
 ORDER_QUOTE_OVERRIDE=""
 SHADOW_MODE_OVERRIDE=""
 WEB_PORT_OVERRIDE=""
+TRANSITION_BACKUP=""
+TRANSITION_VERSION=""
 APPLY=0
 FOLLOW=0
 START_SERVICES=1
@@ -96,6 +98,22 @@ while [[ $# -gt 0 ]]; do
       WEB_PORT_OVERRIDE="$2"
       shift
       ;;
+    --backup)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --backup requires a verified SQLite backup path" >&2
+        exit 64
+      fi
+      TRANSITION_BACKUP="$2"
+      shift
+      ;;
+    --version)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --version requires a 12-character lowercase commit prefix" >&2
+        exit 64
+      fi
+      TRANSITION_VERSION="$2"
+      shift
+      ;;
     --follow|-f)
       FOLLOW=1
       ;;
@@ -168,6 +186,11 @@ if [[ -n "${WEB_PORT_OVERRIDE}" ]]; then
     exit 64
   fi
 fi
+if [[ -n "${TRANSITION_VERSION}" &&
+      ! "${TRANSITION_VERSION}" =~ ^[0-9a-f]{12}$ ]]; then
+  echo "error: --version must be exactly 12 lowercase hexadecimal characters" >&2
+  exit 64
+fi
 
 if [[ "${INSTANCE}" != "default" && "${APP_HOME_EXPLICIT}" -eq 0 ]]; then
   APP_HOME="${DEFAULT_APP_HOME}/instances/${INSTANCE}"
@@ -229,6 +252,8 @@ Commands:
   slack delete    Delete the Keychain item
   backup          Create and verify a SQLite online backup
   retention       Rotate logs and prune files older than configured limits
+  transition-observe
+                  Switch an approved stopped D2 instance to a new observe ledger
   test            Run shell/static operations tests
 
 Options:
@@ -242,6 +267,8 @@ Options:
   --order-quote N Set simulated quote amount per diagnostic entry.
   --shadow-mode M Set observe or diagnostic mode for a new named instance.
   --web-port PORT Set the named instance's localhost dashboard port.
+  --backup PATH   Verified terminal online backup for transition-observe.
+  --version HEX   Exact 12-character deployed commit prefix for the new ledger.
   --follow, -f    Follow logs.
   --no-start      Install/render without loading any service.
 
@@ -257,6 +284,8 @@ Examples:
     --initial-cash 5000000 --order-quote 125000 \
     --shadow-mode diagnostic --web-port 8766 --apply
   ./scripts/mac-studio status --instance eth
+  ./scripts/mac-studio transition-observe --instance d2-btc \
+    --backup "/path/to/verified-terminal.sqlite" --version a1b2c3d4e5f6
 
 No command installs a system LaunchDaemon, invokes sudo, enables live trading, or
 deletes application data. The user must have an active login session so the
@@ -2045,6 +2074,48 @@ run_helper_mutation() {
   fi
 }
 
+transition_observe() {
+  local helper="${REPO_ROOT}/scripts/manage_d2_observe_transition.py"
+  local service
+  local loaded=""
+  local -a arguments
+
+  [[ "${INSTANCE}" != "default" ]] ||
+    die "transition-observe requires an approved named D2 instance"
+  [[ -n "${TRANSITION_BACKUP}" ]] ||
+    die "transition-observe requires --backup"
+  [[ -n "${TRANSITION_VERSION}" ]] ||
+    die "transition-observe requires --version"
+  [[ -x "${helper}" ]] || die "missing executable helper: ${helper}"
+  select_python || die "Python >= 3.11 is required for transition-observe"
+
+  if [[ "${APPLY}" -eq 1 ]]; then
+    require_macos_for_apply
+    for service in "${SERVICES[@]}"; do
+      if service_is_loaded "${service}"; then
+        if [[ -n "${loaded}" ]]; then loaded+=", "; fi
+        loaded+="${service}"
+      fi
+    done
+    [[ -z "${loaded}" ]] ||
+      die "stop every ${INSTANCE} LaunchAgent before transition-observe; loaded: ${loaded}"
+  fi
+
+  arguments=(
+    "${helper}"
+    --home "${APP_HOME}"
+    --instance "${INSTANCE}"
+    --backup "${TRANSITION_BACKUP}"
+    --version "${TRANSITION_VERSION}"
+  )
+  if [[ "${APPLY}" -eq 1 ]]; then
+    PYTHONDONTWRITEBYTECODE=1 "${PYTHON_BIN}" "${arguments[@]}" --apply
+  else
+    PYTHONDONTWRITEBYTECODE=1 "${PYTHON_BIN}" "${arguments[@]}"
+    note "Dry-run only. Stop all instance services and rerun with --apply after review."
+  fi
+}
+
 case "${COMMAND}" in
   help|"")
     usage
@@ -2115,6 +2186,9 @@ case "${COMMAND}" in
     ;;
   retention)
     run_helper_mutation "${REPO_ROOT}/scripts/mac-studio-retention"
+    ;;
+  transition-observe)
+    transition_observe
     ;;
   test)
     "${REPO_ROOT}/scripts/test-mac-studio-ops.sh"

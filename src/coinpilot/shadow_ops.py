@@ -478,11 +478,13 @@ def run_watchdog(
     """Insert one idempotent outbox alert when the latest feed is stale."""
 
     now = time.time_ns() if now_wall_ns is None else now_wall_ns
-    run_id = store.latest_run_id(market)
-    if run_id is None:
+    feed_anchor = store.read_latest_feed_anchor(market)
+    if feed_anchor is None:
         return {"status": "no_run", "alert_enqueued": False}
-    status = store.read_status(run_id)
-    anchor = status.get("last_book_wall_ns") or status.get("started_wall_ns")
+    run_id = str(feed_anchor["run_id"])
+    anchor = feed_anchor.get("last_book_wall_ns") or feed_anchor.get(
+        "started_wall_ns"
+    )
     if anchor is None:
         return {"status": "no_time_anchor", "alert_enqueued": False}
     age_ns = max(0, now - int(anchor))

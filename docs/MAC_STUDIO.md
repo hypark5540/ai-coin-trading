@@ -24,7 +24,8 @@ Upbit 키는 사용하지 않는다.
 
 프로세스는 다음과 같이 분리된다.
 
-- `shadow`: 공개 WebSocket, 실시간 feature, 모의 주문·체결, shadow 원장
+- `shadow`: 공개 WebSocket, 실시간 feature와 shadow 원장. `observe` profile은
+  주문·체결 없이 관측만 하고, 별도 승인된 diagnostic profile만 모의 체결을 만든다.
 - `paper`: 기본 비활성인 60분봉 C2 forward-paper 계좌
 - `notifier`: 직전 완료 KST 1시간을 집계해 Slack 요약 전송 및 재시도
 - `web`: localhost 전용 읽기 API와 dashboard
@@ -186,11 +187,13 @@ mode·port가 다르면 설치기는 보존된 설정을 덮어쓰지 않고 실
 인스턴스의 DB, archive, backup, log 경로가 자기 app home을 벗어나거나 다른
 instance와 dashboard port가 겹쳐도 시작을 거부한다.
 
-### D2 10% bounded 진단
+### D2 public-feed observe
 
-기존 `diagnostic-imbalance-flow-v0`의 1% 손실 원장은 재개하지 않는다. 손실
-구조를 추가 관찰할 때만 새 원장인 D2를 사용하며, 이 정책은 여전히 alpha가
-아니다.
+현재 D2 네 인스턴스는 공개 WebSocket의 continuity·freshness·운영 배관만
+관찰하는 `observe-public-feed-v1`이다. 결정·주문·체결을 생성하지 않으며
+decisions/orders/fills/pending이 하나라도 생기면 profile 위반으로 fail-closed한다.
+과거 bounded diagnostic은 2026-08-03에 모두 flat/pending 0으로 종료했고 재가동하지
+않는다.
 
 | 인스턴스 | 시장 | Dashboard | 모의자금 | 주문금액 |
 | --- | --- | --- | ---: | ---: |
@@ -199,33 +202,66 @@ instance와 dashboard port가 겹쳐도 시작을 거부한다.
 | `d2-xrp` | KRW-XRP | `127.0.0.1:8776` | ₩5,000,000 | ₩25,000 |
 | `d2-sol` | KRW-SOL | `127.0.0.1:8777` | ₩5,000,000 | ₩25,000 |
 
-D2 운영 profile은 다음 값을 fail-closed로 강제한다.
+D2 활성 profile은 다음 값을 fail-closed로 강제한다.
 
 ```text
-shadow.model_version=diagnostic-bounded-v1
+shadow.mode=observe
+shadow.model_version=observe-public-feed-v1
 shadow.max_daily_loss_pct=0.10
 shadow.max_drawdown_pct=0.10
-COINPILOT_BOUNDED_SHADOW=1
-COINPILOT_SHADOW_COOLDOWN_SECONDS=3600
-COINPILOT_SHADOW_MAX_ROUND_TRIPS_PER_DAY=24
-COINPILOT_SHADOW_RESERVE_FULL_ORDER_LOSS=1
-COINPILOT_SHADOW_EXECUTION_SPREAD_RECHECK=1
+COINPILOT_BOUNDED_SHADOW=0
+COINPILOT_ENABLE_SHADOW=1
+COINPILOT_ENABLE_PAPER=0
 COINPILOT_ENABLE_NOTIFIER=0
 ```
 
-일손실 또는 peak drawdown이 `>= 10%`가 되면 열린 포지션의 risk exit를 먼저
-시도하고 flat이 된 뒤 `external_halt:*`를 영구 기록한다. 신규 진입의 spread
-검사는 risk exit를 막지 않는다. 시장 gap에서는 청산 체결가 때문에 최종 손실이
-10%를 넘을 수 있으므로 10%를 보장된 stop 체결가로 해석하면 안 된다. 신규 진입
-전에는 주문원금과 진입 수수료 전체를 잔여 손실예산으로 예약해, 알고 있는
-위험만으로 경계를 넘는 주문을 거부한다.
+2026-08-03 배포 버전의 활성 원장은 각 instance에 다음 이름으로 존재한다.
 
-halt 시 `state/<run-id>.halt-diagnostic.json`에 초기자금 손익, KST 당일 손실,
-peak drawdown, restart lineage 누적 수수료·회전율과 개선 gate를 mode `0600`으로
-기록한다. 전원 차단이 halt commit과 파일 기록 사이에 발생해도 다음 시작에서
-원장을 읽어 누락 파일을 재생성한다. 자동으로 코드를 바꾸거나 같은 원장을
-재개하지는 않는다. 동결 원장 검산, 모든 비용을 포함한 causal replay, 시간분할과
-2배 비용 stress를 통과한 새 모델 버전만 새 원장에서 시작할 수 있다.
+```text
+data/shadow-observe-public-feed-v1-431ddb7ff5c2.db
+state/d2-observe-transition-431ddb7ff5c2.json
+```
+
+transition receipt가 보존한 bounded diagnostic terminal 합계는 실현손익
+`-₩31,740.288130`, 수수료 `₩22,220.239976`, decisions/orders 각 `1,818`, fills
+`1,778`, pending `0`이다. 시장별 실현손익은 BTC `-₩7,840.140535`, ETH
+`-₩7,958.320007`, XRP `-₩7,230.933218`, SOL `-₩8,710.894369`다. 이 결과는
+수익 alpha 부재와 비용 지배를 확인한 동결 증거이며 활성 observe PnL에 합산하지
+않는다. 중앙 성적표도 current active ledger only로 집계한다.
+
+향후 다른 diagnostic 원장을 observe로 전환해야 할 때만 다음 순서를 한 instance씩
+사용한다. 현재 전환 완료된 네 D2에 이 명령을 다시 실행하지 않는다.
+
+```bash
+./scripts/mac-studio status --instance d2-btc
+./scripts/mac-studio doctor --instance d2-btc
+./scripts/mac-studio backup --instance d2-btc --apply
+./scripts/mac-studio stop all --instance d2-btc --apply
+./scripts/mac-studio status --instance d2-btc
+./scripts/mac-studio backup --instance d2-btc --apply
+
+./scripts/mac-studio transition-observe --instance d2-btc \
+  --backup "/exact/terminal/backup/from/previous/command.sqlite" \
+  --version 0123456789ab
+./scripts/mac-studio transition-observe --instance d2-btc \
+  --backup "/exact/terminal/backup/from/previous/command.sqlite" \
+  --version 0123456789ab --apply
+
+./scripts/mac-studio install --instance d2-btc --no-start --apply
+./scripts/mac-studio start all --instance d2-btc --apply
+./scripts/mac-studio doctor --instance d2-btc
+./scripts/mac-studio status --instance d2-btc
+```
+
+`--version`은 CI를 통과해 실제 설치할 commit의 정확한 12자리 prefix여야 한다.
+전환기는 모든 instance LaunchAgent가 unloaded인지 wrapper에서 확인하고, writer
+lock·stopped·flat·pending 0·halt 없음·실주문 불변조건을 다시 검증한다. 정지 뒤에도
+WAL/SHM이 남을 수 있으므로 삭제하거나 checkpoint/truncate하지 않는다. 전환기는
+원본 main/WAL/SHM의 identity·크기·SHA-256을 고정하고 private copy의 main+WAL로
+standalone snapshot을 만든 뒤 검증된 terminal online backup과 schema·terminal
+state·전체 logical dump hash를 비교한다. SHM은 논리 source of truth로 쓰지 않고
+원본 해시 증거만 receipt에 남긴다. 설정 변경 뒤에도 기존 원장, sidecar, pre-stop/
+terminal backup은 모두 보존한다.
 
 점검 명령은 다음과 같다.
 
@@ -236,10 +272,10 @@ for instance in d2-btc d2-eth d2-xrp d2-sol; do
 done
 ```
 
-`doctor`는 helper 존재, 10% 설정과 bounded profile까지 검사한다. bounded flag가
-없거나 오타이거나, 필수 reserve/recheck가 꺼졌거나, cooldown/cap이 완화되면
-일반 shadow로 내려가지 않고 시작을 거부한다. helper와 service wrapper 및 네
-bounded runtime 값은 run deployment fingerprint에 포함된다.
+`doctor`는 helper, owner-only 설정, 정확한 observe profile, 비활성 paper/notifier,
+localhost dashboard와 LaunchAgent 상태를 검사한다. API에서는 `strategy_mode=observe`,
+ready/fresh, flat, decisions/fills/pending 0과 `simulated=true`,
+`live_order_routing=false`, `orders_sent=0`을 함께 확인한다.
 
 ## 필수 macOS 설정
 
@@ -419,10 +455,10 @@ backlog 또는 retry 가능한 receipt 중 하루만 처리한다. 따라서 여
   sell 시각에 인식한 **회계 실현손익**과, position이 flat으로 돌아온 최종 sell
   시각에 귀속한 **완료 round-trip P&L/승률/보유시간**을 구분한다. 일/전일/최근
   7일/lineage 체결·수수료·회전대금도 함께 보낸다.
-- D2: 자정 `<= start`의 마지막 causal equity anchor와 `< end` sample로 계산한
-  일 변화·수익률·DD, 경계 sample lag와 partial 여부, 최신 restart lineage의
-  branch/cycle 검증, run/reconnect/halt/continuity, pending·freshness·10% fail-closed
-  상태, current config·설치 code fingerprint 및 cash/position/average-cost 검산
+- D2 observe: current active ledger의 결정·주문·체결·pending 0, flat/equity 불변,
+  run/reconnect/halt/continuity, feed freshness, unresolved audit outbox의 개수·심각도·
+  oldest age, current config와 설치 code fingerprint를 검산한다. 전환 전 diagnostic
+  손익은 receipt/동결 원장에 남기고 일일 활성 PnL에 자동 합산하지 않는다.
 - C2: fill replay로 검산한 실현손익, current cash/position, ACTIVE/revision/
   updated_at, frozen config fingerprint와 설치 package manifest. 보존된 과거 account는
   현재 manifest account 집계에서 제외하되 삭제하지 않는다.

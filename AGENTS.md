@@ -22,9 +22,11 @@
 - 모든 운영 확인에서 `simulated=true`, `live_order_routing=false`,
   `orders_sent=0`이어야 한다. 하나라도 다르면 신규 모의결정을 중단하고 원인을
   조사한다.
-- D2는 수익성이 검증된 alpha가 아니라 체결·위험·회계 배관을 검증하는
-  diagnostic 전략이다. 일손실 또는 peak drawdown 10% 경계는 fail-closed로
-  유지한다. 경계를 넘긴 원장은 자동 rearm하지 않는다.
+- 현재 D2는 `observe-public-feed-v1` 공개피드 관측 전용이다. 결정·주문·체결을
+  생성하지 않으며 활성 원장에서 decisions/orders/fills가 하나라도 생기면 장애로
+  취급한다. 2026-08-03에 종료한 bounded diagnostic은 수익 alpha가 아니었고
+  terminal 손실·수수료는 transition receipt와 동결 원장에 보존한다. 그 전략이나
+  원장을 재가동하지 않는다.
 - 코드·설정 fingerprint가 달라졌거나 halt된 원장은 그대로 재사용하지 않는다.
   기존 원장과 검증 백업을 보존하고, 검토된 새 versioned
   `shadow.database_path`로 시작한다.
@@ -33,8 +35,10 @@
 
 ## 활성 토폴로지
 
-- D2 bounded diagnostic shadow: `d2-btc`, `d2-eth`, `d2-xrp`, `d2-sol`.
-  Dashboard port는 각각 `8774`, `8775`, `8776`, `8777`이다.
+- D2 public-feed observe shadow: `d2-btc`, `d2-eth`, `d2-xrp`, `d2-sol`.
+  Dashboard port는 각각 `8774`, `8775`, `8776`, `8777`이고 활성 원장은
+  `shadow-observe-public-feed-v1-431ddb7ff5c2.db`다. shadow/web/
+  external-watchdog/backup/retention만 운용한다.
 - C2 60분봉 forward-paper: `c2-btc`, `c2-eth`, `c2-xrp`, `c2-sol`.
   C2 dashboard와 shadow 서비스는 비활성이며 paper 서비스만 운용한다.
 - 통합 일일 성적표는 중앙 LaunchAgent `dev.coinpilot.daily-scorecard` 하나만
@@ -66,6 +70,9 @@
   처리한다.
 - D2의 fresh `warmup`은 살아 있는 상태다. `stopped`, `halted_recovery`,
   `feed_stale`과 구분한다. `/health/ready`는 running+fresh일 때만 200이어야 한다.
+- 중앙 성적표는 D2의 현재 활성 observe 원장만 집계한다. 과거 bounded diagnostic
+  결과를 활성 PnL에 자동 합산하지 말고 각 instance의
+  `state/d2-observe-transition-431ddb7ff5c2.json` receipt를 사용한다.
 - C2는 60분봉 전략이므로 체결과 손익이 오랫동안 변하지 않아도 정상일 수 있다.
   LaunchAgent PID, `revision`, `updated_at`, `halt_state`를 함께 확인한다.
 - 일일 성적표의 자가개선 항목은 관측·분석·오프라인 후보 제안까지만 허용한다.
@@ -91,6 +98,10 @@
   clean stop, 새 versioned ledger, `install --no-start --apply`, 순차 start,
   doctor, readiness 연속 관찰 순서를 지킨다. 문서만 바뀐 경우 새 원장을 만들지
   않는다.
+- 동결 diagnostic에서 observe로 전환하는 경우 `transition-observe`의 dry-run과
+  `--apply`를 사용한다. 정지된 main/WAL/SHM을 삭제·truncate·checkpoint하지 말고,
+  전환 도구가 private copy의 main+WAL과 검증된 terminal online backup을 논리
+  비교해 receipt를 만든 뒤에만 새 원장을 시작한다.
 
 ## 기준 문서
 

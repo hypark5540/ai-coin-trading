@@ -1,6 +1,6 @@
 # CoinPilot operations handoff
 
-> 마지막 갱신: 2026-07-23 03:08 KST
+> 마지막 갱신: 2026-08-03 19:15 KST
 > 이 문서는 시점 스냅샷이다. 손익, PID, revision, readiness 같은 동적 값은
 > 반드시 다시 조회하며 현재 관측 결과가 이 문서보다 우선한다.
 
@@ -10,11 +10,128 @@
 | --- | --- |
 | 저장소 | `hypark5540/ai-coin-trading` |
 | branch | `agent/bounded-shadow-risk-controls` |
-| D2 배포 코드 / handoff baseline | `ab784db022047cfaee89d5123a1e6aeac958bb2a` |
-| 중앙 daily-scorecard 배포 코드 | `f5f53909f296dd6a99a1a79a46de7bbdbc5b8b24` |
+| D2 배포 코드 / observe ledger version | `431ddb7ff5c24fbe96c29a9a4d4cc1737024e71c` |
+| 중앙 daily-scorecard 기능 배포 코드 | `49334b30b566f734c24b2a5db3225bb1d2e18765` |
 | repository HEAD | 세션 시작 시 재조회. handoff 문서 commit은 D2 배포 코드보다 뒤일 수 있음 |
 | PR | Draft PR #1, base `main` |
 | `main` | `9033db3e93e5966a823dd44a6473a2e426e7b77c` |
+
+## 2026-08-03 D2 observe 전환과 현재 상태
+
+### 판단과 변경
+
+기존 D2 bounded diagnostic은 배관 검사용 전략이었고 수익 alpha가 아니었다.
+2026-08-03 종료 시점 네 원장의 모든 관측 일자가 gross 기준으로도 손실이었으며,
+terminal 합계는 실현손익 `-₩31,740.288130`, 수수료 `₩22,220.239976`였다. 수수료
+규모가 전체 손실의 약 70%이고 계속 운용할수록 비용을 추가하는 구조여서 신규
+모의결정을 중단했다. 이 결론은 장애가 없다는 뜻이 아니라, 전략 성과에는 명확한
+문제가 있고 운영 배관은 별도로 관찰할 가치가 있다는 뜻이다.
+
+D2 네 instance를 주문 없는 `observe-public-feed-v1`로 전환했다. C2는 유일한
+forward-paper challenger로 그대로 두었고 install/update/restart하지 않았다.
+자가개선은 일일 성적표의 관측·오프라인 후보 제안까지만 허용하며 활성 전략,
+fingerprint, halt, account 또는 ledger를 자동 변경하지 않는다.
+
+구현에는 다음이 포함된다.
+
+- D2 observe exact profile과 decisions/orders/fills/pending 0 검증
+- 중앙 성적표의 current active ledger only 경계, outbox pending/sending 심각도와
+  oldest-age 가시성, observe 전용 개선 gate 문구
+- `/api/status` latest health의 correlated MAX 제거와 watchdog의 경량 feed anchor
+- `transition-observe` dry-run/apply 도구와 원자적 config/runtime/receipt 기록
+- 정지된 main/WAL/SHM 원본을 변경하지 않는 private-copy 검증. main+committed WAL로
+  standalone snapshot을 만든 뒤 terminal online backup과 schema, terminal state,
+  row counts, health, 전체 logical dump SHA-256을 비교하고 SHM은 해시 증거로만 보존
+
+### D2 terminal 증거와 활성 원장
+
+모든 source는 flat, pending 0, latched halt 없음, `live_order_routing=false`,
+`orders_sent=0` 상태에서 clean stop했다. 각 instance마다 실행 중 online backup과
+정지 후 terminal online backup을 모두 만들었고 `.sha256`, SQLite integrity,
+foreign key, logical snapshot 일치를 검증했다. 기존 DB/WAL/SHM과 두 backup은
+삭제·checkpoint·truncate하지 않았다.
+
+| instance | terminal backup | 실현손익 | 수수료 | decisions / orders / fills | pending |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `d2-btc` | `coinpilot-20260803T094729Z.sqlite` | -₩7,840.140535 | ₩6,524.342101 | 529 / 529 / 522 | 0 |
+| `d2-eth` | `coinpilot-20260803T100837Z.sqlite` | -₩7,958.320007 | ₩5,898.970325 | 477 / 477 / 472 | 0 |
+| `d2-xrp` | `coinpilot-20260803T101012Z.sqlite` | -₩7,230.933218 | ₩4,773.771419 | 396 / 396 / 382 | 0 |
+| `d2-sol` | `coinpilot-20260803T101130Z.sqlite` | -₩8,710.894369 | ₩5,023.156131 | 416 / 416 / 402 | 0 |
+| 합계 | terminal receipt 4개 | -₩31,740.288130 | ₩22,220.239976 | 1,818 / 1,818 / 1,778 | 0 |
+
+각 owner-only receipt는 다음 경로에 있고 source main/WAL/SHM의 identity, size,
+개별 SHA-256과 bundle SHA-256, terminal 상태, backup hash, 새 target을 기록한다.
+
+```text
+~/Library/Application Support/Coinpilot/instances/<instance>/state/
+  d2-observe-transition-431ddb7ff5c2.json
+```
+
+19:13 KST 최종 관측에서 네 D2는 모두 `ready`, fresh feed, flat이며
+`strategy_mode=observe`, decisions/fills/pending `0/0/0`, cash/equity
+`₩5,000,000`, 실현손익/수수료 `0/0`이다. 모든 API에서 `simulated=true`,
+`live_order_routing=false`, `orders_sent=0`을 확인했고 Doctor는 각 0 error/0 warning,
+단일 `/api/status` 표본 응답시간은 2.7–5.4ms였다.
+
+```text
+data/shadow-observe-public-feed-v1-431ddb7ff5c2.db
+dashboard: d2-btc 8774, d2-eth 8775, d2-xrp 8776, d2-sol 8777
+loaded: shadow, web, external-watchdog, backup, retention
+disabled/not-loaded: paper, notifier
+```
+
+현재 D2 active PnL은 observe 원장의 0이며, 위 diagnostic terminal 결과는 자동
+합산하지 않는다. 중앙 성적표 dry-run은 이 경계를 명시하고 observe 네 원장의
+audit unresolved 8건(warning/critical 0)을 보고했다. per-instance notifier가 승인상
+OFF이므로 outbox는 전달 backlog가 아니라 audit 품질 원장이다. 동결 diagnostic
+receipt의 outbox 합계 5,667건도 같은 이유로 보존한다.
+
+### C2와 중앙 성적표
+
+19:13 KST에 C2 paper LaunchAgent 네 개는 모두 running/ready, flat,
+`halt_state=ACTIVE`였고 revision과 `updated_at`이 계속 증가했다.
+
+| instance | revision | updated_at 관측 | 실현손익 | 설치본 검증 |
+| --- | ---: | --- | ---: | --- |
+| `c2-btc` | 38,844 | 2026-08-03 19:13:36 KST | -₩14,583.35 | `valid=true` |
+| `c2-eth` | 36,712 | 2026-08-03 19:13:36 KST | ₩0 | `valid=true` |
+| `c2-xrp` | 36,825 | 2026-08-03 19:13:35 KST | ₩0 | `valid=true` |
+| `c2-sol` | 35,297 | 2026-08-03 19:13:36 KST | ₩0 | `valid=true` |
+
+설치된 네 package SHA-256은 모두
+`340abde0c6383e4bd98baef7daef6f8b44ca33b1798390a79450c8fd86e931b2`로 manifest와
+일치한다. 현재 repository source가 frozen C2 source와 달라 각 Doctor가 알려진
+`immutable C2 manifest drift` 1 error를 보고하지만 추가 error/warning은 없고
+설치본 자체와 runtime은 정상이다. 기존 C2에 install/update하여 이 표시만 없애지
+않는다. 공통 관측은 12/30일, 누적 완료 거래는 BTC 1건뿐이므로 성과 결론을 내릴
+표본이 아니다.
+
+19:18 KST 재조회에서 revision은 각각 38,854 / 36,722 / 36,835 / 35,300으로
+증가해 네 runtime이 살아 있음을 다시 확인했다. SOL은 60분봉·저빈도 갱신 특성상
+`updated_at`이 다른 세 시장보다 느렸지만 LaunchAgent PID와 ACTIVE/readiness는
+정상이었다.
+
+중앙 `dev.coinpilot.daily-scorecard`는 loaded/enabled, Doctor 0 error다. 최신 due
+`2026-08-02`는 delivery count 13, backlog 0, unresolved receipt 0,
+`healthy=true`이며 artifact SHA-256은
+`3132c21c1a5cab1dfde5f83fbf36688e7835db67ff28849bf19779350a8a6b8c`다.
+
+### 검증과 남은 위험
+
+- 로컬 전체 Python `380`개 테스트, `./scripts/mac-studio test`,
+  `git diff --check` 성공
+- 배포 commit `431ddb7`의 [Push CI](https://github.com/hypark5540/ai-coin-trading/actions/runs/30804051009)와
+  [PR CI](https://github.com/hypark5540/ai-coin-trading/actions/runs/30804053886)에서
+  Ubuntu/macOS 4개 작업 모두 성공
+- legacy `8766/8767/8772/8773` listener 없음. `8765`는
+  `/Users/hypark5540/ai-stock-trading`의 KRXAITrader 소유로 확인했고 건드리지 않음
+- D2 observe는 거래 성과를 만들지 않는다. C2 표본 부족이 해소될 때까지 수익성
+  개선을 주장할 수 없음
+- C2 historical intraday DD는 원장 구조상 `N/A`, repository-source Doctor drift는
+  계속 남음
+- 중앙 Slack은 POST 성공과 local receipt 사이의 드문 at-least-once 중복 경계가
+  있고, 같은 Mac 내부 watchdog는 전원·인터넷 완전 단절을 외부에서 감지하지 못함
+- 다음 계획된 로그인/재부팅 뒤 persistent disable 유지 여부는 다시 실측해야 함
 
 `ab784db`에서 정상적인 `receive_interval` 관측 침묵이 warmup을 반복
 초기화하던 문제를 수정했다. `/api/status`는 feed freshness와 lifecycle을
@@ -118,7 +235,7 @@ config fingerprint는 바꾸지 않는다. 따라서 현재 D2를 install/redepl
 원장으로 전환하지 않았다. 다음 계획된 로그인/재부팅 뒤 persistent disable이
 유지되는지는 다시 실측한다. 이 검증만을 위해 운영 호스트를 재부팅하지 않는다.
 
-## 현재 운영 토폴로지
+## 2026-07-23 당시 운영 토폴로지 (historical)
 
 ### D2 bounded diagnostic shadow
 
@@ -216,11 +333,13 @@ manifest의 자체 검증은 일치하고 런타임은 ACTIVE이므로 현재 �
 - 중앙 배포 전후 D2/C2 managed hash와 run/account fingerprint 동일
 - 배포 전 기존 D2 네 원장 SQLite integrity check와 backup checksum 성공
 - 배포 후 신규 D2 네 원장 SQLite integrity check 성공, run lineage 각 1개
-- 재부팅 후 D2/C2/legacy 관련 DB SQLite integrity check 성공; 현재 D2 run
+- 재부팅 후 D2/C2/legacy 관련 DB SQLite integrity check 성공; 당시 D2 run
   lineage 각 2개
 
 관련 변경 이력:
 
+- `431ddb7` — WAL/SHM byte-preserving D2 observe transition 검증
+- `49334b3` — D2 observe, active-ledger 성적표와 status/watchdog 최적화
 - `ab784db` — false receive gap 및 readiness 표시 수정
 - `2cb9ec6` — launchd restart race 수정
 - `e10a9bf` — Homebrew Python 선택 수정
@@ -253,9 +372,9 @@ for port in 8774 8775 8776 8777; do
 done
 ```
 
-확인할 핵심은 D2의 `ready`, fresh feed, `halt_reason=null`, pending 주문,
-10% 경계와 C2의 `ACTIVE`, revision/updated_at 증가다. 모든 API에서
-`live_order_routing=false`, `orders_sent=0`을 재확인한다.
+확인할 핵심은 D2의 `ready`, fresh feed, `strategy_mode=observe`, flat,
+decisions/fills/pending `0/0/0`과 C2의 `ACTIVE`, revision/updated_at 증가다. 모든
+API에서 `simulated=true`, `live_order_routing=false`, `orders_sent=0`을 재확인한다.
 
 C2 doctor에서는 현재 repository source와 frozen 설치본 차이 때문에 각
 instance의 알려진 `immutable C2 manifest drift` 1 error가 예상된다. 추가
@@ -288,7 +407,7 @@ at-least-once 중복 경계도 유지된다. 향후 C2 개선 시 immutable 검�
 
 먼저 ~/.codex/AGENTS.md, 저장소의 AGENTS.md,
 docs/OPERATIONS_HANDOFF.md, docs/MAC_STUDIO.md, SECURITY.md를 읽어.
-handoff는 2026-07-23 시점 스냅샷이므로 그대로 믿지 말고 git 상태와 실제
+handoff는 2026-08-03 시점 스냅샷이므로 그대로 믿지 말고 git 상태와 실제
 LaunchAgent/API/SQLite 상태를 다시 조회해. 현재 관측 결과가 문서보다 우선이야.
 
 반드시 지킬 것:
@@ -299,6 +418,9 @@ LaunchAgent/API/SQLite 상태를 다시 조회해. 현재 관측 결과가 문�
   rearm하지 말 것.
 - legacy btc/eth/xrp/sol 및 8766/8767/8772/8773을 재가동하지 말 것.
 - legacy instance를 대상으로 start/install/bootstrap을 실행하지 말 것.
+- 동결된 D2 bounded diagnostic 원장이나 전략을 재가동하지 말 것. 현재 D2는
+  `observe-public-feed-v1`, 활성 DB는
+  `shadow-observe-public-feed-v1-431ddb7ff5c2.db`다.
 - 다른 프로젝트가 쓰는 8765를 건드리지 말 것.
 - C2 현재 계정에 install/update를 적용하지 말 것. repo source drift와 실제
   installed runtime 건강 상태를 구분할 것.

@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
+from html.parser import HTMLParser
 from http.server import ThreadingHTTPServer
 
 import pytest
@@ -14,11 +16,13 @@ from coinpilot.shadow_ops import (
     SlackWebhookClient,
     make_status_handler,
     run_notifier,
+    run_watchdog,
     slack_message,
     validate_slack_webhook_url,
 )
 from coinpilot.hft_shadow import ShadowConfig, ShadowEngine
 from coinpilot.hft_shadow_store import ShadowStore
+from coinpilot.shadow_dashboard import dashboard_html
 
 
 class _Response:
@@ -82,6 +86,8 @@ def test_slack_message_forces_shadow_provenance() -> None:
         {
             "severity": "critical",
             "topic": "test",
+            "market": "KRW-ETH",
+            "run_id": "eth-run",
             "payload": {
                 "orders_sent": 999,
                 "config": {"secret": "must-not-appear"},
@@ -90,18 +96,416 @@ def test_slack_message_forces_shadow_provenance() -> None:
     )
     assert "orders_sent\":0" in message["text"]
     assert "simulated\":true" in message["text"]
+    assert "[KRW-ETH]" in message["text"]
+    assert "eth-run" in message["text"]
     assert "secret" not in message["text"]
 
 
 class _NoRunStore:
-    def latest_run_id(self):
+    def __init__(self) -> None:
+        self.markets: list[str] = []
+
+    def latest_run_id(self, market):
+        self.markets.append(market)
         return None
+
+    def read_latest_feed_anchor(self, market):
+        self.markets.append(market)
+        return None
+
+
+class _DashboardContractParser(HTMLParser):
+    """Collect structural and resource-loading contracts without pinning layout."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.tags: list[str] = []
+        self.url_attributes: list[tuple[str, str, str]] = []
+        self.has_live_region = False
+        self.html_language: str | None = None
+
+    def handle_starttag(
+        self,
+        tag: str,
+        attrs: list[tuple[str, str | None]],
+    ) -> None:
+        self.tags.append(tag)
+        attributes = dict(attrs)
+        if tag == "html":
+            self.html_language = attributes.get("lang")
+        if (
+            attributes.get("aria-live") in {"polite", "assertive"}
+            or attributes.get("role") in {"alert", "status"}
+        ):
+            self.has_live_region = True
+        for name in ("src", "href", "action", "poster"):
+            value = attributes.get(name)
+            if value:
+                self.url_attributes.append((tag, name, value))
+
+
+def test_dashboard_root_is_a_self_contained_read_only_interface() -> None:
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        make_status_handler(
+            _NoRunStore(),
+            market="KRW-BTC",
+            stale_after_seconds=60,
+        ),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with urllib.request.urlopen(f"{base}/", timeout=2) as response:
+            assert response.status == 200
+            assert response.headers.get_content_type() == "text/html"
+            assert response.headers.get_content_charset() == "utf-8"
+            assert response.headers["Cache-Control"] == "no-store"
+            content_security_policy = response.headers[
+                "Content-Security-Policy"
+            ]
+            assert "default-src 'self'" in content_security_policy
+            assert "connect-src 'self'" in content_security_policy
+            dashboard = response.read().decode("utf-8")
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    parser = _DashboardContractParser()
+    parser.feed(dashboard)
+    assert parser.html_language
+    assert {"header", "main"} <= set(parser.tags)
+    assert parser.tags.count("section") + parser.tags.count("article") >= 3
+    assert parser.has_live_region
+
+    for endpoint in ("/api/status", "/api/equity", "/api/fills"):
+        assert endpoint in dashboard
+
+    # The dashboard is one inline document: no CDN, analytics, remote fonts,
+    # images, forms, or other resource-loading escape hatch.
+    non_resource_svg_namespace = "http://www.w3.org/2000/svg"
+    dashboard_without_svg_namespace = dashboard.replace(
+        non_resource_svg_namespace,
+        "",
+    )
+    assert "http://" not in dashboard_without_svg_namespace
+    assert "https://" not in dashboard_without_svg_namespace
+    external_url_attributes = [
+        item
+        for item in parser.url_attributes
+        if (
+            urllib.parse.urlsplit(item[2]).scheme not in {"", "data"}
+            or urllib.parse.urlsplit(item[2]).netloc
+        )
+    ]
+    assert external_url_attributes == []
+    assert "form" not in parser.tags
+
+    # Safety state is rendered from the server's forced shadow-only fields.
+    normalized = dashboard.casefold()
+    assert (
+        "read only" in normalized
+        or "read-only" in normalized
+        or "읽기 전용" in dashboard
+    )
+    for safety_field in ("simulated", "orders_sent", "live_order_routing"):
+        assert safety_field in dashboard
+    for readiness_field in ("feed_fresh", "readiness_reason"):
+        assert readiness_field in dashboard
+    for distinct_state in (
+        "Live · warming up",
+        "Feed stale",
+        "Waiting for feed",
+        "Shadow stopped",
+    ):
+        assert distinct_state in dashboard
+
+
+def test_dashboard_uses_configured_market_units_before_first_status() -> None:
+    dashboard = dashboard_html("KRW-ETH").decode("utf-8")
+
+    assert "KRW—ETH" in dashboard
+    assert "0 ETH held" in dashboard
+    assert 'const configuredMarket = "KRW-ETH";' in dashboard
+    assert "BTC held" not in dashboard
+    assert "formatKrw" not in dashboard
+
+
+class _MarketStore:
+    def __init__(self) -> None:
+        self.latest_calls: list[str] = []
+        self.runs = {
+            "KRW-BTC": "btc-run",
+            "KRW-ETH": "eth-run",
+        }
+
+    def latest_run_id(self, market):
+        self.latest_calls.append(market)
+        return self.runs.get(market)
+
+    def read_status(self, run_id):
+        market = "KRW-BTC" if run_id == "btc-run" else "KRW-ETH"
+        return {
+            "run_id": run_id,
+            "market": market,
+            "status": "running",
+            "lifecycle_status": "running",
+            "started_wall_ns": 1,
+            "last_book_wall_ns": 900,
+            "live_order_routing": False,
+        }
+
+    def recent_fills(self, run_id, *, limit):
+        return [{"run_id": run_id, "limit": limit}]
+
+    def read_equity(self, run_id, *, limit):
+        return [{"run_id": run_id, "limit": limit}]
+
+
+class _ReadinessStore:
+    def __init__(self, status):
+        self.status = status
+
+    def latest_run_id(self, market):
+        return "status-run"
+
+    def read_status(self, run_id):
+        assert run_id == "status-run"
+        return {
+            "run_id": run_id,
+            "market": "KRW-BTC",
+            "status": self.status["lifecycle_status"],
+            "started_wall_ns": 1,
+            "live_order_routing": False,
+            **self.status,
+        }
+
+
+@pytest.mark.parametrize(
+    (
+        "lifecycle",
+        "last_book_wall_ns",
+        "expected_ready",
+        "expected_fresh",
+        "expected_reason",
+    ),
+    [
+        ("running", 99_000_000_000, True, True, "ready"),
+        ("warmup", 99_000_000_000, False, True, "warmup"),
+        ("halted_recovery", 99_000_000_000, False, True, "halted_recovery"),
+        ("halted_recovery", 39_000_000_000, False, False, "halted_recovery"),
+        ("stopped", 99_000_000_000, False, True, "stopped"),
+        ("stopped", 39_000_000_000, False, False, "stopped"),
+        ("running", 39_000_000_000, False, False, "feed_stale"),
+        ("warmup", None, False, False, "feed_unavailable"),
+    ],
+)
+def test_status_api_separates_feed_freshness_from_strategy_readiness(
+    lifecycle: str,
+    last_book_wall_ns: int | None,
+    expected_ready: bool,
+    expected_fresh: bool,
+    expected_reason: str,
+) -> None:
+    store = _ReadinessStore(
+        {
+            "lifecycle_status": lifecycle,
+            "last_book_wall_ns": last_book_wall_ns,
+        }
+    )
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        make_status_handler(
+            store,
+            market="KRW-BTC",
+            stale_after_seconds=60,
+            wall_time_ns=lambda: 100_000_000_000,
+        ),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with urllib.request.urlopen(f"{base}/api/status", timeout=2) as response:
+            assert response.status == 200
+            status_payload = json.loads(response.read())
+        try:
+            response = urllib.request.urlopen(
+                f"{base}/health/ready",
+                timeout=2,
+            )
+        except urllib.error.HTTPError as error:
+            ready_status = error.code
+            ready_payload = json.loads(error.read())
+        else:
+            with response:
+                ready_status = response.status
+                ready_payload = json.loads(response.read())
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    expected_status = 200 if expected_ready else 503
+    assert ready_status == expected_status
+    for payload in (status_payload, ready_payload):
+        assert payload["ready"] is expected_ready
+        assert payload["feed_fresh"] is expected_fresh
+        assert payload["readiness_reason"] == expected_reason
+
+
+@pytest.mark.parametrize(
+    ("market", "expected_run"),
+    [("KRW-BTC", "btc-run"), ("KRW-ETH", "eth-run")],
+)
+def test_status_server_never_crosses_configured_market(
+    market: str,
+    expected_run: str,
+) -> None:
+    store = _MarketStore()
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        make_status_handler(
+            store,
+            market=market,
+            stale_after_seconds=60,
+            wall_time_ns=lambda: 1_000,
+        ),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    try:
+        for endpoint in ("/api/status", "/api/fills", "/api/equity"):
+            with urllib.request.urlopen(f"{base}{endpoint}", timeout=2) as response:
+                payload = json.loads(response.read())
+            assert payload["run_id"] == expected_run
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    assert store.latest_calls == [market, market, market]
+
+
+def test_status_and_watchdog_do_not_fallback_to_another_market() -> None:
+    store = _NoRunStore()
+    server = ThreadingHTTPServer(
+        ("127.0.0.1", 0),
+        make_status_handler(
+            store,
+            market="KRW-ETH",
+            stale_after_seconds=60,
+        ),
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with pytest.raises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(
+                f"http://127.0.0.1:{server.server_port}/api/status",
+                timeout=2,
+            )
+        assert raised.value.code == 503
+        payload = json.loads(raised.value.read())
+        assert payload["ready"] is False
+        assert payload["feed_fresh"] is False
+        assert payload["readiness_reason"] == "no_shadow_run"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    result = run_watchdog(
+        store,
+        market="KRW-ETH",
+        stale_after_seconds=60,
+        now_wall_ns=1_000,
+    )
+    assert result == {"status": "no_run", "alert_enqueued": False}
+    assert store.markets == ["KRW-ETH", "KRW-ETH"]
+
+
+def test_watchdog_uses_only_the_lightweight_feed_anchor_lookup() -> None:
+    class Store:
+        def __init__(self) -> None:
+            self.markets: list[str] = []
+
+        def read_latest_feed_anchor(self, market):
+            self.markets.append(market)
+            return {
+                "run_id": "latest-run",
+                "started_wall_ns": 1_000_000_000,
+                "last_book_wall_ns": 99_000_000_000,
+            }
+
+        def latest_run_id(self, market):
+            raise AssertionError("watchdog must use one anchor lookup")
+
+        def read_status(self, run_id):
+            raise AssertionError("watchdog must not build full status")
+
+    store = Store()
+    result = run_watchdog(
+        store,
+        market="KRW-BTC",
+        stale_after_seconds=60,
+        now_wall_ns=100_000_000_000,
+    )
+
+    assert result == {
+        "status": "ok",
+        "feed_age_seconds": 1.0,
+        "alert_enqueued": False,
+    }
+    assert store.markets == ["KRW-BTC"]
+
+
+def test_watchdog_stale_alert_remains_idempotent_with_anchor_lookup(
+    tmp_path,
+) -> None:
+    store = ShadowStore(tmp_path / "shadow.db")
+    engine, _ = ShadowEngine.start(
+        store,
+        ShadowConfig(market="KRW-BTC"),
+        run_id="watchdog-run",
+        started_wall_ns=1_000_000_000,
+    )
+
+    first = run_watchdog(
+        store,
+        market="KRW-BTC",
+        stale_after_seconds=60,
+        now_wall_ns=100_000_000_000,
+    )
+    second = run_watchdog(
+        store,
+        market="KRW-BTC",
+        stale_after_seconds=60,
+        now_wall_ns=101_000_000_000,
+    )
+
+    assert first["status"] == "critical"
+    assert second["status"] == "critical"
+    stale = [
+        row
+        for row in store.pending_notifications(run_id=engine.run_id)
+        if row["topic"] == "shadow_feed_stale"
+    ]
+    assert len(stale) == 1
+    assert stale[0]["payload"]["last_feed_wall_ns"] == 1_000_000_000
 
 
 def test_local_status_server_has_no_mutation_endpoint() -> None:
     server = ThreadingHTTPServer(
         ("127.0.0.1", 0),
-        make_status_handler(_NoRunStore(), stale_after_seconds=60),
+        make_status_handler(
+            _NoRunStore(),
+            market="KRW-BTC",
+            stale_after_seconds=60,
+        ),
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

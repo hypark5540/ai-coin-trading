@@ -7,7 +7,6 @@ code.
 
 from __future__ import annotations
 
-import html
 import json
 import os
 import socket
@@ -23,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from coinpilot.hft_shadow_store import ShadowStore
+from coinpilot.shadow_dashboard import dashboard_html as _dashboard_html
 
 
 class ShadowOperationsError(RuntimeError):
@@ -161,10 +161,15 @@ class SlackWebhookClient:
 def slack_message(notification: Mapping[str, Any]) -> dict[str, str]:
     severity = str(notification.get("severity", "info")).upper()
     topic = str(notification.get("topic", "shadow_event"))
+    market = str(notification.get("market", "")).strip()
     payload = notification.get("payload")
     safe_payload = dict(payload) if isinstance(payload, Mapping) else {}
     safe_payload.pop("config", None)
     safe_payload.pop("config_hash", None)
+    for field in ("run_id", "market"):
+        value = notification.get(field)
+        if value is not None and str(value).strip():
+            safe_payload.setdefault(field, value)
     safe_payload["simulated"] = True
     safe_payload["orders_sent"] = 0
     encoded = json.dumps(
@@ -174,7 +179,11 @@ def slack_message(notification: Mapping[str, Any]) -> dict[str, str]:
         separators=(",", ":"),
         allow_nan=False,
     )
-    text = f"[COINPILOT SHADOW][{severity}] {topic}\n`{encoded[:2600]}`"
+    market_tag = f"[{market}]" if market else ""
+    text = (
+        f"[COINPILOT SHADOW]{market_tag}[{severity}] {topic}\n"
+        f"`{encoded[:2600]}`"
+    )
     return {"text": text}
 
 
@@ -205,7 +214,14 @@ def run_notifier(
         for row in rows:
             notification_id = str(row["notification_id"])
             try:
-                client.send(slack_message(row))
+                outbound = dict(row)
+                run_id = outbound.get("run_id")
+                if run_id:
+                    run_status = store.read_status(str(run_id))
+                    market = run_status.get("market")
+                    if market is not None:
+                        outbound["market"] = market
+                client.send(slack_message(outbound))
             except SlackDeliveryError as exc:
                 failed += 1
                 attempts = int(row.get("attempt_count", 0)) + 1
@@ -275,32 +291,47 @@ def _public_status(status: Mapping[str, Any], *, now_wall_ns: int) -> dict[str, 
     return result
 
 
-def _dashboard_html() -> bytes:
-    content = """<!doctype html>
-<html lang="ko"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>CoinPilot Shadow</title>
-<style>
-body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#0b1020;color:#e8edf8;margin:2rem}
-main{max-width:1000px;margin:auto}.card{background:#151d33;border:1px solid #2d3958;border-radius:12px;padding:1rem;margin:1rem 0}
-.ok{color:#62d49c}.bad{color:#ff7b72}pre{white-space:pre-wrap;overflow-wrap:anywhere}small{color:#9dadc9}
-</style></head><body><main><h1>CoinPilot Shadow</h1>
-<small>읽기 전용 · 실제 주문 0 · 5초 자동 갱신</small>
-<section class="card"><div id="state">불러오는 중…</div></section>
-<section class="card"><pre id="details"></pre></section>
-<script>
-async function refresh(){const state=document.getElementById('state'),details=document.getElementById('details');
-try{const r=await fetch('/api/status',{cache:'no-store'}),j=await r.json();
-state.className=r.ok?'ok':'bad';state.textContent=r.ok?`${j.market} · ${j.lifecycle_status} · equity ${j.last_equity_quote}`:`상태 오류 (${r.status})`;
-details.textContent=JSON.stringify(j,null,2)}catch(e){state.className='bad';state.textContent='연결 실패';details.textContent=''}}
-refresh();setInterval(refresh,5000);
-</script></main></body></html>"""
-    return content.encode("utf-8")
+def _with_readiness(
+    status: Mapping[str, Any],
+    *,
+    stale_after_seconds: int,
+) -> dict[str, Any]:
+    """Add orthogonal feed-freshness and strategy-readiness fields."""
+
+    result = dict(status)
+    feed_age = result.get("feed_age_seconds")
+    feed_fresh = (
+        feed_age is not None
+        and float(feed_age) <= stale_after_seconds
+    )
+    lifecycle = str(result.get("lifecycle_status") or "unknown")
+    ready = lifecycle == "running" and feed_fresh
+    if ready:
+        reason = "ready"
+    elif lifecycle in {"halted_recovery", "stopped"}:
+        reason = lifecycle
+    elif feed_age is None:
+        reason = "feed_unavailable"
+    elif not feed_fresh:
+        reason = "feed_stale"
+    elif lifecycle == "warmup":
+        reason = lifecycle
+    else:
+        reason = "lifecycle_not_running"
+    result.update(
+        {
+            "ready": ready,
+            "feed_fresh": feed_fresh,
+            "readiness_reason": reason,
+        }
+    )
+    return result
 
 
 def make_status_handler(
     store: ShadowStore,
     *,
+    market: str,
     stale_after_seconds: int,
     wall_time_ns: Callable[[], int] = time.time_ns,
 ) -> type[BaseHTTPRequestHandler]:
@@ -327,7 +358,9 @@ def make_status_handler(
             self.send_header(
                 "Content-Security-Policy",
                 "default-src 'self'; style-src 'unsafe-inline'; "
-                "script-src 'unsafe-inline'; connect-src 'self'",
+                "script-src 'unsafe-inline'; connect-src 'self'; "
+                "base-uri 'none'; object-src 'none'; form-action 'none'; "
+                "frame-ancestors 'none'",
             )
             self.end_headers()
             self.wfile.write(body)
@@ -350,22 +383,33 @@ def make_status_handler(
                 self._json(200, {"live": True, "orders_sent": 0})
                 return
             if path == "/":
-                self._send(200, _dashboard_html(), "text/html; charset=utf-8")
+                self._send(
+                    200,
+                    _dashboard_html(market),
+                    "text/html; charset=utf-8",
+                )
                 return
-            run_id = store.latest_run_id()
+            run_id = store.latest_run_id(market)
             if run_id is None:
-                self._json(503, {"error": "no_shadow_run", "orders_sent": 0})
+                self._json(
+                    503,
+                    {
+                        "error": "no_shadow_run",
+                        "ready": False,
+                        "feed_fresh": False,
+                        "readiness_reason": "no_shadow_run",
+                        "orders_sent": 0,
+                    },
+                )
                 return
             now = wall_time_ns()
             status = store.read_status(run_id)
-            public = _public_status(status, now_wall_ns=now)
+            public = _with_readiness(
+                _public_status(status, now_wall_ns=now),
+                stale_after_seconds=stale_after_seconds,
+            )
             if path in {"/readyz", "/health/ready"}:
-                ready = (
-                    public.get("lifecycle_status") == "running"
-                    and public.get("feed_age_seconds") is not None
-                    and float(public["feed_age_seconds"]) <= stale_after_seconds
-                )
-                self._json(200 if ready else 503, {"ready": ready, **public})
+                self._json(200 if public["ready"] else 503, public)
                 return
             if path in {"/healthz", "/api/status"}:
                 self._json(200, public)
@@ -404,6 +448,7 @@ def serve_status(
     *,
     host: str,
     port: int,
+    market: str,
     stale_after_seconds: int,
 ) -> None:
     if host != "127.0.0.1":
@@ -412,6 +457,7 @@ def serve_status(
         raise ValueError("port must be between 1024 and 65535")
     handler = make_status_handler(
         store,
+        market=market,
         stale_after_seconds=stale_after_seconds,
     )
     server = ThreadingHTTPServer((host, port), handler)
@@ -425,17 +471,20 @@ def serve_status(
 def run_watchdog(
     store: ShadowStore,
     *,
+    market: str,
     stale_after_seconds: int,
     now_wall_ns: int | None = None,
 ) -> dict[str, Any]:
     """Insert one idempotent outbox alert when the latest feed is stale."""
 
     now = time.time_ns() if now_wall_ns is None else now_wall_ns
-    run_id = store.latest_run_id()
-    if run_id is None:
+    feed_anchor = store.read_latest_feed_anchor(market)
+    if feed_anchor is None:
         return {"status": "no_run", "alert_enqueued": False}
-    status = store.read_status(run_id)
-    anchor = status.get("last_book_wall_ns") or status.get("started_wall_ns")
+    run_id = str(feed_anchor["run_id"])
+    anchor = feed_anchor.get("last_book_wall_ns") or feed_anchor.get(
+        "started_wall_ns"
+    )
     if anchor is None:
         return {"status": "no_time_anchor", "alert_enqueued": False}
     age_ns = max(0, now - int(anchor))

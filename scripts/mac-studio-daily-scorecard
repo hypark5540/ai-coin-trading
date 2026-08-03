@@ -1,0 +1,904 @@
+#!/usr/bin/env bash
+# Isolated daily scorecard installer. Mutating commands are dry-run by default.
+
+set -euo pipefail
+IFS=$'\n\t'
+umask 077
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
+[[ -n "${HOME:-}" && "${HOME}" == /* && "${HOME}" != "/" ]] || {
+  echo "error: HOME must be a non-root absolute path" >&2
+  exit 64
+}
+USER_HOME="${HOME%/}"
+EXPECTED_COINPILOT_ROOT="${USER_HOME}/Library/Application Support/Coinpilot"
+EXPECTED_REPORT_HOME="${EXPECTED_COINPILOT_ROOT}/reporting"
+if [[ -n "${COINPILOT_ROOT:-}" &&
+      "${COINPILOT_ROOT}" != "${EXPECTED_COINPILOT_ROOT}" ]]; then
+  echo "error: COINPILOT_ROOT is fixed at ${EXPECTED_COINPILOT_ROOT}" >&2
+  exit 64
+fi
+if [[ -n "${COINPILOT_REPORT_HOME:-}" &&
+      "${COINPILOT_REPORT_HOME}" != "${EXPECTED_REPORT_HOME}" ]]; then
+  echo "error: COINPILOT_REPORT_HOME is fixed at ${EXPECTED_REPORT_HOME}" >&2
+  exit 64
+fi
+COINPILOT_ROOT="${EXPECTED_COINPILOT_ROOT}"
+REPORT_HOME="${EXPECTED_REPORT_HOME}"
+KEYCHAIN_SERVICE="${COINPILOT_SLACK_KEYCHAIN_SERVICE:-coinpilot-slack-webhook}"
+KEYCHAIN_ACCOUNT="${COINPILOT_KEYCHAIN_ACCOUNT:-coinpilot-shadow}"
+ACTION="${1:-help}"
+APPLY=0
+START_SERVICE=1
+PYTHON_BIN=""
+
+validate_keychain_selector() {
+  local selector_name="$1"
+  local selector_value="$2"
+  if [[ ${#selector_value} -lt 1 || ${#selector_value} -gt 128 ||
+        ! "${selector_value}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    printf 'error: %s must be a 1-128 character Keychain identifier\n' \
+      "${selector_name}" >&2
+    exit 64
+  fi
+}
+
+if [[ $# -gt 0 ]]; then shift; fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply) APPLY=1 ;;
+    --dry-run) APPLY=0 ;;
+    --no-start) START_SERVICE=0 ;;
+    --root|--report-home)
+      echo "error: $1 is not configurable; reporting paths are fixed below HOME" >&2
+      exit 64
+      ;;
+    --keychain-service)
+      [[ $# -ge 2 ]] || { echo "error: --keychain-service requires a value" >&2; exit 64; }
+      KEYCHAIN_SERVICE="$2"
+      shift
+      ;;
+    --keychain-account)
+      [[ $# -ge 2 ]] || { echo "error: --keychain-account requires a value" >&2; exit 64; }
+      KEYCHAIN_ACCOUNT="$2"
+      shift
+      ;;
+    --help|-h) ACTION="help" ;;
+    *) echo "error: unknown option: $1" >&2; exit 64 ;;
+  esac
+  shift
+done
+
+validate_keychain_selector "Keychain service" "${KEYCHAIN_SERVICE}"
+validate_keychain_selector "Keychain account" "${KEYCHAIN_ACCOUNT}"
+
+LABEL="dev.coinpilot.daily-scorecard"
+BIN_DIR="${REPORT_HOME}/bin"
+STATE_DIR="${REPORT_HOME}/state"
+ARTIFACT_DIR="${REPORT_HOME}/reports"
+LOG_DIR="${REPORT_HOME}/logs"
+RENDER_DIR="${REPORT_HOME}/launchd"
+SOURCE_REPORTER="${REPO_ROOT}/scripts/coinpilot_daily_scorecard.py"
+INSTALLED_REPORTER="${BIN_DIR}/coinpilot-daily-scorecard"
+SOURCE_TEMPLATE="${REPO_ROOT}/ops/reporting/dev.coinpilot.daily-scorecard.plist.in"
+RENDERED_PLIST="${RENDER_DIR}/${LABEL}.plist"
+INSTALLED_PLIST="${USER_HOME}/Library/LaunchAgents/${LABEL}.plist"
+INSTALL_MANIFEST="${STATE_DIR}/installed-helper.json"
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./scripts/mac-studio-daily-scorecard <command> [options]
+
+Commands:
+  install      Install the isolated helper and LaunchAgent
+  start        Enable and bootstrap the LaunchAgent
+  stop         Persistently disable and unload the LaunchAgent
+  status       Show launchd and latest delivery state
+  doctor       Validate sources, helper, Keychain, plist, and launchd state
+  run          Preview the due report; use --apply to deliver if not sent
+  uninstall    Remove only helper/plist; preserve reports, state, and logs
+
+Options:
+  --apply                  Perform a mutation (dry-run is the default)
+  --no-start               Install but leave the LaunchAgent disabled
+  --keychain-service NAME  Slack Keychain service identifier
+  --keychain-account NAME  Slack Keychain account identifier
+
+Keychain identifiers are 1-128 ASCII letters, digits, dots, underscores, or
+hyphens, beginning with a letter or digit. URLs and whitespace are rejected.
+
+This tool only manages dev.coinpilot.daily-scorecard. It never starts, stops,
+installs, or updates a D2/C2/legacy trading instance.
+The application root and reporting home are fixed at:
+  ~/Library/Application Support/Coinpilot
+  ~/Library/Application Support/Coinpilot/reporting
+EOF
+}
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+note() { printf '==> %s\n' "$*"; }
+
+quote_cmd() {
+  local arg
+  printf '[dry-run]'
+  for arg in "$@"; do printf ' %q' "$arg"; done
+  printf '\n'
+}
+
+run_cmd() {
+  if [[ "${APPLY}" -eq 1 ]]; then "$@"; else quote_cmd "$@"; fi
+}
+
+is_macos() { [[ "$(uname -s)" == "Darwin" ]]; }
+
+require_macos_for_apply() {
+  if [[ "${APPLY}" -eq 1 ]] && ! is_macos; then
+    die "apply mode is supported only on macOS"
+  fi
+}
+
+reject_symlink_components() {
+  local current="$1"
+  [[ "${current}" == /* ]] || die "managed path must be absolute: ${current}"
+  while true; do
+    [[ ! -L "${current}" ]] || die "symlinked managed path is not allowed: ${current}"
+    [[ "${current}" == "/" ]] && break
+    current="${current%/*}"
+    [[ -n "${current}" ]] || current="/"
+  done
+}
+
+validate_reporting_paths() {
+  [[ "${COINPILOT_ROOT}" == "${EXPECTED_COINPILOT_ROOT}" ]] ||
+    die "Coinpilot root escaped its fixed boundary"
+  [[ "${REPORT_HOME}" == "${EXPECTED_REPORT_HOME}" ]] ||
+    die "reporting home escaped its fixed boundary"
+  [[ "${BIN_DIR}" == "${REPORT_HOME}/bin" &&
+     "${STATE_DIR}" == "${REPORT_HOME}/state" &&
+     "${ARTIFACT_DIR}" == "${REPORT_HOME}/reports" &&
+     "${LOG_DIR}" == "${REPORT_HOME}/logs" &&
+     "${RENDER_DIR}" == "${REPORT_HOME}/launchd" ]] ||
+    die "one or more reporting paths escaped the reporting home"
+  reject_symlink_components "${COINPILOT_ROOT}"
+  reject_symlink_components "${REPORT_HOME}"
+  reject_symlink_components "${INSTALLED_REPORTER}"
+  reject_symlink_components "${INSTALL_MANIFEST}"
+  reject_symlink_components "${RENDERED_PLIST}"
+  reject_symlink_components "${INSTALLED_PLIST}"
+}
+
+select_python() {
+  local candidate
+  for candidate in \
+    "${COINPILOT_PYTHON:-}" \
+    "/opt/homebrew/bin/python3.12" \
+    "/usr/local/bin/python3.12" \
+    "$(command -v python3.12 2>/dev/null || true)" \
+    "$(command -v python3 2>/dev/null || true)"; do
+    if [[ -n "${candidate}" && -x "${candidate}" ]] &&
+        PYTHONDONTWRITEBYTECODE=1 "${candidate}" -c \
+          'import sys; raise SystemExit(sys.version_info < (3, 11))' \
+          >/dev/null 2>&1; then
+      PYTHON_BIN="${candidate}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+launch_domain() {
+  local uid
+  uid="$(id -u)"
+  if launchctl print "gui/${uid}" >/dev/null 2>&1; then
+    printf 'gui/%s' "${uid}"
+  elif launchctl print "user/${uid}" >/dev/null 2>&1; then
+    printf 'user/%s' "${uid}"
+  else
+    return 1
+  fi
+}
+
+service_target() {
+  local domain
+  domain="$(launch_domain 2>/dev/null || true)"
+  printf '%s/%s' "${domain:-gui/$(id -u)}" "${LABEL}"
+}
+
+service_is_loaded() {
+  launchctl print "$(service_target)" >/dev/null 2>&1
+}
+
+wait_for_service_unloaded() {
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    if ! service_is_loaded; then
+      return 0
+    fi
+    if [[ "${attempt}" -lt 5 ]]; then /bin/sleep 1; fi
+  done
+  return 1
+}
+
+keychain_has_slack() {
+  command -v security >/dev/null 2>&1 || return 1
+  security find-generic-password \
+    -a "${KEYCHAIN_ACCOUNT}" -s "${KEYCHAIN_SERVICE}" >/dev/null 2>&1
+}
+
+stop_service() {
+  local domain
+  local errors=""
+  local output=""
+  domain="$(launch_domain 2>/dev/null || true)"
+  if [[ "${APPLY}" -eq 1 ]]; then
+    [[ -n "${domain}" ]] || die "launchd user domain is unavailable"
+    if ! output="$(launchctl disable "${domain}/${LABEL}" 2>&1)"; then
+      errors="launchctl disable failed: ${output}"
+    fi
+    if ! output="$(launchctl bootout "${domain}/${LABEL}" 2>&1)" && service_is_loaded; then
+      if [[ -n "${errors}" ]]; then errors+="; "; fi
+      errors+="launchctl bootout failed: ${output}"
+    fi
+    if ! wait_for_service_unloaded; then
+      if [[ -n "${errors}" ]]; then errors+="; "; fi
+      errors+="launchd job remained loaded after bootout"
+    fi
+    [[ -z "${errors}" ]] || die "failed to stop ${LABEL}: ${errors}"
+  else
+    domain="${domain:-gui/$(id -u)}"
+    quote_cmd launchctl disable "${domain}/${LABEL}"
+    quote_cmd launchctl bootout "${domain}/${LABEL}"
+  fi
+}
+
+launchd_override_state() {
+  local domain="$1"
+  local result
+  result="$(launchctl print-disabled "${domain}" 2>/dev/null | awk -v wanted="${LABEL}" '
+    {
+      line=$0
+      sub(/^[[:space:]]*/, "", line)
+      gsub(/\"/, "", line)
+      split(line, pair, /[[:space:]]*=>[[:space:]]*/)
+      gsub(/[[:space:],;]+$/, "", pair[1])
+      gsub(/[[:space:],;]+$/, "", pair[2])
+      if (pair[1] == wanted) {
+        if (pair[2] == "true" || pair[2] == "1" || pair[2] == "disabled") print "disabled"
+        else if (pair[2] == "false" || pair[2] == "0" || pair[2] == "enabled") print "enabled"
+        else print "unknown"
+        exit
+      }
+    }
+  ')"
+  printf '%s' "${result:-unset}"
+}
+
+verify_installed_bundle() {
+  [[ -x "${INSTALLED_REPORTER}" && -f "${SOURCE_REPORTER}" &&
+     -f "${INSTALLED_PLIST}" && -f "${INSTALL_MANIFEST}" ]] || return 1
+  select_python || return 1
+  "${PYTHON_BIN}" - \
+    "${INSTALLED_REPORTER}" "${SOURCE_REPORTER}" \
+    "${INSTALLED_PLIST}" "${INSTALL_MANIFEST}" \
+    "${LABEL}" "${PYTHON_BIN}" "${COINPILOT_ROOT}" "${REPORT_HOME}" \
+    "${STATE_DIR}" "${ARTIFACT_DIR}" "${LOG_DIR}" \
+    "${KEYCHAIN_SERVICE}" "${KEYCHAIN_ACCOUNT}" <<'PY'
+import hashlib
+import json
+import pathlib
+import plistlib
+import stat
+import sys
+
+(
+    helper_raw,
+    source_raw,
+    plist_raw,
+    manifest_raw,
+    label,
+    python_executable,
+    coinpilot_root,
+    report_home,
+    state_dir,
+    artifact_dir,
+    log_dir,
+    keychain_service,
+    keychain_account,
+) = sys.argv[1:]
+helper = pathlib.Path(helper_raw)
+source = pathlib.Path(source_raw)
+plist_path = pathlib.Path(plist_raw)
+manifest_path = pathlib.Path(manifest_raw)
+
+
+def reject_symlinks(path: pathlib.Path) -> None:
+    current = path.absolute()
+    while True:
+        if current.is_symlink():
+            raise SystemExit(f"symlinked installed reporting path: {path.name}")
+        if current == current.parent:
+            return
+        current = current.parent
+
+
+for candidate in (helper, source, plist_path, manifest_path):
+    reject_symlinks(candidate)
+    if not candidate.is_file():
+        raise SystemExit(f"installed reporting file is missing: {candidate.name}")
+
+helper_bytes = helper.read_bytes()
+source_bytes = source.read_bytes()
+plist_bytes = plist_path.read_bytes()
+if helper_bytes != source_bytes:
+    raise SystemExit("installed reporter differs from repository source")
+
+try:
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+    raise SystemExit("installed reporting manifest is invalid") from exc
+expected_manifest = {
+    "schema_version": 2,
+    "helper": {
+        "path": str(helper),
+        "sha256": hashlib.sha256(helper_bytes).hexdigest(),
+    },
+    "launch_agent": {
+        "label": label,
+        "path": str(plist_path),
+        "sha256": hashlib.sha256(plist_bytes).hexdigest(),
+    },
+}
+if manifest != expected_manifest:
+    raise SystemExit("installed reporter or LaunchAgent manifest mismatch")
+
+try:
+    actual_plist = plistlib.loads(plist_bytes)
+except Exception as exc:
+    raise SystemExit("installed reporting LaunchAgent is invalid") from exc
+expected_plist = {
+    "Label": label,
+    "ProgramArguments": [
+        python_executable,
+        str(helper),
+        "--root",
+        coinpilot_root,
+        "--state-dir",
+        state_dir,
+        "--artifact-dir",
+        artifact_dir,
+        "--keychain-service",
+        keychain_service,
+        "--keychain-account",
+        keychain_account,
+        "--schedule-hour",
+        "0",
+        "--schedule-minute",
+        "10",
+    ],
+    "WorkingDirectory": report_home,
+    "RunAtLoad": True,
+    "StartCalendarInterval": {"Minute": 10},
+    "ThrottleInterval": 60,
+    "ProcessType": "Background",
+    "Nice": 10,
+    "LowPriorityIO": True,
+    "Umask": 63,
+    "StandardOutPath": f"{log_dir}/daily-scorecard.stdout.log",
+    "StandardErrorPath": f"{log_dir}/daily-scorecard.stderr.log",
+}
+if actual_plist != expected_plist:
+    raise SystemExit("installed reporting LaunchAgent semantics differ from policy")
+
+expected_modes = {
+    helper: 0o755,
+    plist_path: 0o644,
+    manifest_path: 0o600,
+}
+for path, expected_mode in expected_modes.items():
+    actual_mode = stat.S_IMODE(path.stat().st_mode)
+    if actual_mode != expected_mode:
+        raise SystemExit(
+            f"unexpected mode for {path.name}: {actual_mode:o}, expected {expected_mode:o}"
+        )
+PY
+}
+
+validate_sources() {
+  local reporter="$1"
+  select_python || die "Python >= 3.11 is required"
+  "${PYTHON_BIN}" "${reporter}" \
+    --root "${COINPILOT_ROOT}" \
+    --state-dir "${STATE_DIR}" \
+    --artifact-dir "${ARTIFACT_DIR}" \
+    --keychain-service "${KEYCHAIN_SERVICE}" \
+    --keychain-account "${KEYCHAIN_ACCOUNT}" \
+    --dry-run >/dev/null
+}
+
+render_plist() {
+  if [[ "${APPLY}" -eq 0 ]]; then
+    quote_cmd "${PYTHON_BIN}" -c "render ${SOURCE_TEMPLATE} -> ${INSTALLED_PLIST}"
+    return 0
+  fi
+  "${PYTHON_BIN}" - \
+    "${SOURCE_TEMPLATE}" "${RENDERED_PLIST}" \
+    "LABEL=${LABEL}" \
+    "PYTHON_EXECUTABLE=${PYTHON_BIN}" \
+    "REPORTER_EXECUTABLE=${INSTALLED_REPORTER}" \
+    "COINPILOT_ROOT=${COINPILOT_ROOT}" \
+    "REPORT_HOME=${REPORT_HOME}" \
+    "STATE_DIR=${STATE_DIR}" \
+    "ARTIFACT_DIR=${ARTIFACT_DIR}" \
+    "LOG_DIR=${LOG_DIR}" \
+    "KEYCHAIN_SERVICE=${KEYCHAIN_SERVICE}" \
+    "KEYCHAIN_ACCOUNT=${KEYCHAIN_ACCOUNT}" <<'PY'
+import html
+import os
+import pathlib
+import plistlib
+import sys
+
+template = pathlib.Path(sys.argv[1])
+destination = pathlib.Path(sys.argv[2])
+replacements = dict(item.split("=", 1) for item in sys.argv[3:])
+text = template.read_text(encoding="utf-8")
+for key, value in replacements.items():
+    text = text.replace(f"@@{key}@@", html.escape(value, quote=True))
+if "@@" in text:
+    raise SystemExit("unresolved reporting plist placeholder")
+plistlib.loads(text.encode("utf-8"))
+temporary = destination.with_name(destination.name + ".tmp")
+temporary.write_text(text, encoding="utf-8")
+os.chmod(temporary, 0o600)
+os.replace(temporary, destination)
+PY
+  install -m 0644 "${RENDERED_PLIST}" "${INSTALLED_PLIST}"
+}
+
+write_install_manifest() {
+  if [[ "${APPLY}" -eq 0 ]]; then
+    quote_cmd "${PYTHON_BIN}" -c \
+      "write helper and LaunchAgent SHA-256 manifest ${INSTALL_MANIFEST}"
+    return 0
+  fi
+  "${PYTHON_BIN}" - \
+    "${INSTALLED_REPORTER}" "${INSTALLED_PLIST}" \
+    "${INSTALL_MANIFEST}" "${LABEL}" <<'PY'
+import hashlib
+import json
+import os
+import pathlib
+import sys
+
+helper = pathlib.Path(sys.argv[1])
+plist_path = pathlib.Path(sys.argv[2])
+destination = pathlib.Path(sys.argv[3])
+label = sys.argv[4]
+payload = {
+    "schema_version": 2,
+    "helper": {
+        "path": str(helper),
+        "sha256": hashlib.sha256(helper.read_bytes()).hexdigest(),
+    },
+    "launch_agent": {
+        "label": label,
+        "path": str(plist_path),
+        "sha256": hashlib.sha256(plist_path.read_bytes()).hexdigest(),
+    },
+}
+temporary = destination.with_name(destination.name + ".tmp")
+temporary.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+os.chmod(temporary, 0o600)
+os.replace(temporary, destination)
+PY
+}
+
+ROLLBACK_ERROR=""
+rollback_failed_start() {
+  local domain="$1"
+  local errors=""
+  local output=""
+  if ! output="$(launchctl disable "${domain}/${LABEL}" 2>&1)"; then
+    errors="rollback disable failed: ${output}"
+  fi
+  if ! output="$(launchctl bootout "${domain}/${LABEL}" 2>&1)" && service_is_loaded; then
+    if [[ -n "${errors}" ]]; then errors+="; "; fi
+    errors+="rollback bootout failed: ${output}"
+  fi
+  if ! wait_for_service_unloaded; then
+    if [[ -n "${errors}" ]]; then errors+="; "; fi
+    errors+="rollback left the job loaded"
+  fi
+  ROLLBACK_ERROR="${errors}"
+  [[ -z "${errors}" ]]
+}
+
+start_service() {
+  local domain
+  local attempt
+  local launch_error=""
+  local output=""
+  domain="$(launch_domain 2>/dev/null || true)"
+  if [[ "${APPLY}" -eq 0 ]]; then
+    domain="${domain:-gui/$(id -u)}"
+    quote_cmd launchctl bootout "${domain}/${LABEL}"
+    quote_cmd launchctl enable "${domain}/${LABEL}"
+    quote_cmd launchctl bootstrap "${domain}" "${INSTALLED_PLIST}"
+    return 0
+  fi
+  [[ -n "${domain}" ]] || die "launchd user domain is unavailable"
+  if ! (validate_reporting_paths); then
+    rollback_failed_start "${domain}" || true
+    die "reporting path validation failed${ROLLBACK_ERROR:+; ${ROLLBACK_ERROR}}"
+  fi
+  if [[ ! -f "${INSTALLED_PLIST}" ]] || ! verify_installed_bundle; then
+    rollback_failed_start "${domain}" || true
+    die "installed reporting bundle failed self-verification${ROLLBACK_ERROR:+; ${ROLLBACK_ERROR}}"
+  fi
+  if ! keychain_has_slack; then
+    rollback_failed_start "${domain}" || true
+    die "Slack Keychain item is missing${ROLLBACK_ERROR:+; ${ROLLBACK_ERROR}}"
+  fi
+  if ! validate_sources "${INSTALLED_REPORTER}"; then
+    rollback_failed_start "${domain}" || true
+    die "daily scorecard sources failed validation${ROLLBACK_ERROR:+; ${ROLLBACK_ERROR}}"
+  fi
+  if ! output="$(launchctl bootout "${domain}/${LABEL}" 2>&1)" && service_is_loaded; then
+    rollback_failed_start "${domain}" || true
+    die "launchctl bootout failed before start: ${output}${ROLLBACK_ERROR:+; ${ROLLBACK_ERROR}}"
+  fi
+  if ! wait_for_service_unloaded; then
+    rollback_failed_start "${domain}" || true
+    die "launchd job did not settle after bootout${ROLLBACK_ERROR:+; ${ROLLBACK_ERROR}}"
+  fi
+  if ! output="$(launchctl enable "${domain}/${LABEL}" 2>&1)"; then
+    rollback_failed_start "${domain}" || true
+    die "launchctl enable failed: ${output}${ROLLBACK_ERROR:+; ${ROLLBACK_ERROR}}"
+  fi
+  for attempt in 1 2 3 4 5; do
+    if output="$(launchctl bootstrap "${domain}" "${INSTALLED_PLIST}" 2>&1)"; then
+      /bin/sleep 1
+      if service_is_loaded; then
+        return 0
+      fi
+      launch_error="bootstrap returned success but ${LABEL} did not remain loaded"
+    else
+      launch_error="launchctl bootstrap failed: ${output}"
+      if service_is_loaded; then
+        /bin/sleep 1
+        if service_is_loaded; then
+          return 0
+        fi
+      fi
+    fi
+    if [[ "${attempt}" -lt 5 ]]; then
+      launchctl bootout "${domain}/${LABEL}" >/dev/null 2>&1 || true
+      if ! wait_for_service_unloaded; then
+        launch_error+="; job did not settle before retry"
+        break
+      fi
+      /bin/sleep 1
+    fi
+  done
+  rollback_failed_start "${domain}" || true
+  die "failed to start ${LABEL} after ${attempt} attempt(s): ${launch_error}${ROLLBACK_ERROR:+; ${ROLLBACK_ERROR}}"
+}
+
+install_service() {
+  require_macos_for_apply
+  select_python || die "Python >= 3.11 is required"
+  [[ -f "${SOURCE_REPORTER}" ]] || die "missing reporter source: ${SOURCE_REPORTER}"
+  [[ -f "${SOURCE_TEMPLATE}" ]] || die "missing reporting plist template"
+  note "Reconciling only ${LABEL}"
+  stop_service
+  validate_reporting_paths
+  note "Installing the isolated read-only reporter"
+  run_cmd install -d -m 0700 \
+    "${BIN_DIR}" "${STATE_DIR}" "${ARTIFACT_DIR}" "${LOG_DIR}" "${RENDER_DIR}"
+  run_cmd install -d -m 0755 "$(dirname "${INSTALLED_PLIST}")"
+  run_cmd install -m 0755 "${SOURCE_REPORTER}" "${INSTALLED_REPORTER}"
+  render_plist
+  write_install_manifest
+  if [[ "${APPLY}" -eq 1 ]]; then
+    verify_installed_bundle || die "installed reporting bundle failed verification"
+  fi
+  if [[ "${START_SERVICE}" -eq 1 ]]; then
+    start_service
+  else
+    note "Reporter installed but persistently disabled (--no-start)"
+  fi
+  if [[ "${APPLY}" -eq 0 ]]; then note "Dry-run only. Rerun with --apply."; fi
+}
+
+latest_due_delivery_health() {
+  select_python || return 1
+  "${PYTHON_BIN}" - "${STATE_DIR}" "${ARTIFACT_DIR}" <<'PY'
+import hashlib
+import json
+import pathlib
+import stat
+import sys
+import time
+from datetime import datetime, time as datetime_time, timedelta
+from zoneinfo import ZoneInfo
+
+state_dir = pathlib.Path(sys.argv[1]).absolute()
+artifact_dir = pathlib.Path(sys.argv[2]).absolute()
+now = datetime.now(ZoneInfo("Asia/Seoul"))
+deadline = datetime.combine(
+    now.date(),
+    datetime_time(hour=0, minute=10),
+    tzinfo=now.tzinfo,
+)
+due_date = now.date() - timedelta(days=1 if now >= deadline else 2)
+date_text = due_date.isoformat()
+report_id = f"daily-scorecard:v1:{date_text}"
+state_path = state_dir / "deliveries" / f"{date_text}.json"
+
+
+def reject_symlinks(path: pathlib.Path) -> None:
+    current = path.absolute()
+    while True:
+        if current.is_symlink():
+            raise SystemExit(f"symlinked delivery path: {path.name}")
+        if current == current.parent:
+            return
+        current = current.parent
+
+
+reject_symlinks(state_path)
+if not state_path.is_file():
+    raise SystemExit(f"latest due delivery receipt is missing: {date_text}")
+if stat.S_IMODE(state_path.stat().st_mode) != 0o600:
+    raise SystemExit(f"latest due delivery receipt is not owner-only: {date_text}")
+try:
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+    raise SystemExit(f"latest due delivery receipt is invalid: {date_text}") from exc
+if not isinstance(state, dict):
+    raise SystemExit(f"latest due delivery receipt is not an object: {date_text}")
+if state.get("report_id") != report_id or state.get("report_date") != date_text:
+    raise SystemExit(f"latest due delivery identity mismatch: {date_text}")
+if state.get("status") != "delivered":
+    raise SystemExit(
+        f"latest due delivery is not delivered: {date_text} ({state.get('status')})"
+    )
+delivered_wall_ns = state.get("delivered_wall_ns")
+if (
+    isinstance(delivered_wall_ns, bool)
+    or not isinstance(delivered_wall_ns, int)
+    or delivered_wall_ns <= 0
+    or delivered_wall_ns > time.time_ns() + 5_000_000_000
+):
+    raise SystemExit(f"latest due delivery timestamp is invalid: {date_text}")
+if state.get("last_error") is not None:
+    raise SystemExit(f"latest due delivery retains an error: {date_text}")
+
+artifacts = state.get("artifacts")
+if not isinstance(artifacts, dict):
+    raise SystemExit(f"latest due delivery has no artifact receipt: {date_text}")
+stem = f"coinpilot-daily-scorecard-v1-{date_text}"
+expected_paths = {
+    "json": artifact_dir / f"{stem}.json",
+    "markdown": artifact_dir / f"{stem}.md",
+    "checksum": artifact_dir / f"{stem}.sha256",
+}
+for name, expected in expected_paths.items():
+    actual = pathlib.Path(str(artifacts.get(name, ""))).absolute()
+    if actual != expected:
+        raise SystemExit(f"latest due {name} artifact escaped reporting home: {date_text}")
+    reject_symlinks(actual)
+    if not actual.is_file() or stat.S_IMODE(actual.stat().st_mode) != 0o600:
+        raise SystemExit(f"latest due {name} artifact is missing or unsafe: {date_text}")
+
+json_bytes = expected_paths["json"].read_bytes()
+digest = hashlib.sha256(json_bytes).hexdigest()
+if artifacts.get("sha256") != digest:
+    raise SystemExit(f"latest due JSON artifact checksum mismatch: {date_text}")
+checksum = expected_paths["checksum"].read_text(encoding="ascii").strip()
+if checksum != f"{digest}  {expected_paths['json'].name}":
+    raise SystemExit(f"latest due checksum receipt mismatch: {date_text}")
+try:
+    report = json.loads(json_bytes)
+except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+    raise SystemExit(f"latest due JSON artifact is invalid: {date_text}") from exc
+if not isinstance(report, dict):
+    raise SystemExit(f"latest due JSON artifact is not an object: {date_text}")
+if report.get("report_id") != report_id or report.get("report_date") != date_text:
+    raise SystemExit(f"latest due JSON artifact identity mismatch: {date_text}")
+safety = report.get("safety")
+if not isinstance(safety, dict) or safety.get("verified") is not True:
+    raise SystemExit(f"latest due report safety was not verified: {date_text}")
+print(f"latest due report delivered: {date_text}")
+PY
+}
+
+delivery_backlog_health() {
+  select_python || return 1
+  "${PYTHON_BIN}" "${INSTALLED_REPORTER}" \
+    --root "${COINPILOT_ROOT}" \
+    --state-dir "${STATE_DIR}" \
+    --artifact-dir "${ARTIFACT_DIR}" --status |
+    "${PYTHON_BIN}" -c '
+import json
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+    raise SystemExit("installed reporter returned invalid delivery status") from exc
+if not isinstance(payload, dict):
+    raise SystemExit("installed reporter delivery status is not an object")
+missing = payload.get("missing_backlog_days")
+unresolved = payload.get("unresolved_receipts")
+latest_delivered = payload.get("latest_due_delivered")
+if (
+    isinstance(missing, bool)
+    or not isinstance(missing, int)
+    or missing < 0
+    or isinstance(unresolved, bool)
+    or not isinstance(unresolved, int)
+    or unresolved < 0
+):
+    raise SystemExit("installed reporter delivery counters are invalid")
+if (
+    payload.get("healthy") is not True
+    or latest_delivered is not True
+    or missing != 0
+    or unresolved != 0
+):
+    raise SystemExit(
+        "delivery backlog is not healthy: "
+        f"latest_due_delivered={latest_delivered}, "
+        f"missing={missing}, unresolved={unresolved}"
+    )
+latest_date = payload.get("latest_due_report_date")
+if not isinstance(latest_date, str) or not latest_date:
+    raise SystemExit("installed reporter latest due date is invalid")
+print(f"delivery backlog healthy through {latest_date}")
+'
+}
+
+show_status() {
+  local launch_state="not-loaded"
+  local override="unknown"
+  local domain
+  local delivery_health=""
+  domain="$(launch_domain 2>/dev/null || true)"
+  if service_is_loaded; then launch_state="loaded"; fi
+  if [[ -n "${domain}" ]]; then
+    override="$(launchd_override_state "${domain}")"
+  fi
+  printf 'label: %s\nreport_home: %s\nlaunchd: %s\noverride: %s\n' \
+    "${LABEL}" "${REPORT_HOME}" "${launch_state}" "${override}"
+  if verify_installed_bundle; then
+    "${PYTHON_BIN}" "${INSTALLED_REPORTER}" \
+      --root "${COINPILOT_ROOT}" \
+      --state-dir "${STATE_DIR}" \
+      --artifact-dir "${ARTIFACT_DIR}" --status
+    if delivery_health="$(latest_due_delivery_health 2>&1)"; then
+      printf 'delivery_health: OK (%s)\n' "${delivery_health}"
+    else
+      printf 'delivery_health: FAIL (%s)\n' "${delivery_health:-unavailable}"
+    fi
+  else
+    printf 'delivery: unavailable (reporting bundle not installed or invalid)\n'
+  fi
+}
+
+doctor() {
+  local errors=0
+  local domain=""
+  local override="unknown"
+  local bundle_valid=0
+  local delivery_health=""
+  local backlog_health=""
+  ok() { printf 'OK    %s\n' "$*"; }
+  fail() { printf 'FAIL  %s\n' "$*"; errors=$((errors + 1)); }
+  if is_macos; then ok "macOS detected"; else fail "not running on macOS"; fi
+  if select_python; then ok "Python >= 3.11: ${PYTHON_BIN}"; else fail "Python >= 3.11 not found"; fi
+  if [[ "${COINPILOT_ROOT}" == "${EXPECTED_COINPILOT_ROOT}" &&
+        "${REPORT_HOME}" == "${EXPECTED_REPORT_HOME}" ]]; then
+    ok "Coinpilot and reporting homes are fixed below HOME"
+  else
+    fail "reporting path boundary drift"
+  fi
+  if [[ -x "${INSTALLED_REPORTER}" ]]; then ok "installed reporter exists"; else fail "installed reporter is missing"; fi
+  if verify_installed_bundle; then
+    bundle_valid=1
+    ok "installed helper and LaunchAgent hashes and semantics are valid"
+  else
+    fail "installed reporting bundle manifest, bytes, or semantics mismatch"
+  fi
+  if [[ -f "${SOURCE_REPORTER}" && -f "${INSTALLED_REPORTER}" ]] && cmp -s "${SOURCE_REPORTER}" "${INSTALLED_REPORTER}"; then
+    ok "repository and installed reporter match"
+  else
+    fail "repository and installed reporter differ"
+  fi
+  if keychain_has_slack; then ok "Slack Keychain item exists"; else fail "Slack Keychain item is missing"; fi
+  if [[ "${bundle_valid}" -eq 1 ]] && validate_sources "${INSTALLED_REPORTER}"; then
+    ok "eight allowlisted ledgers and safety invariants are valid"
+  else
+    fail "daily scorecard source validation failed"
+  fi
+  if [[ "${bundle_valid}" -eq 1 ]] &&
+      delivery_health="$(latest_due_delivery_health 2>&1)"; then
+    ok "${delivery_health}"
+  else
+    fail "${delivery_health:-latest due delivery health is unavailable}"
+  fi
+  if [[ "${bundle_valid}" -eq 1 ]] &&
+      backlog_health="$(delivery_backlog_health 2>&1)"; then
+    ok "${backlog_health}"
+  else
+    fail "${backlog_health:-delivery backlog health is unavailable}"
+  fi
+  domain="$(launch_domain 2>/dev/null || true)"
+  if service_is_loaded; then ok "launchd loaded: ${LABEL}"; else fail "launchd not loaded: ${LABEL}"; fi
+  if [[ -n "${domain}" ]]; then override="$(launchd_override_state "${domain}")"; fi
+  if [[ "${override}" == "enabled" ]]; then
+    ok "launchd explicitly enabled: ${LABEL}"
+  else
+    fail "launchd enable override drift: ${LABEL} (${override})"
+  fi
+  printf '\nDoctor summary: %d error(s)\n' "${errors}"
+  [[ "${errors}" -eq 0 ]]
+}
+
+run_report() {
+  select_python || die "Python >= 3.11 is required"
+  if [[ "${APPLY}" -eq 0 ]]; then
+    "${PYTHON_BIN}" "${SOURCE_REPORTER}" \
+      --root "${COINPILOT_ROOT}" \
+      --state-dir "${STATE_DIR}" \
+      --artifact-dir "${ARTIFACT_DIR}" \
+      --keychain-service "${KEYCHAIN_SERVICE}" \
+      --keychain-account "${KEYCHAIN_ACCOUNT}" --dry-run
+    note "Dry-run only. Rerun with --apply to deliver the due report."
+  else
+    validate_reporting_paths
+    verify_installed_bundle || die "installed reporting bundle failed self-verification"
+    "${PYTHON_BIN}" "${INSTALLED_REPORTER}" \
+      --root "${COINPILOT_ROOT}" \
+      --state-dir "${STATE_DIR}" \
+      --artifact-dir "${ARTIFACT_DIR}" \
+      --keychain-service "${KEYCHAIN_SERVICE}" \
+      --keychain-account "${KEYCHAIN_ACCOUNT}"
+  fi
+}
+
+uninstall_service() {
+  require_macos_for_apply
+  validate_reporting_paths
+  stop_service
+  note "Removing only the reporting helper, manifest, and LaunchAgent definition"
+  run_cmd rm -f -- \
+    "${INSTALLED_REPORTER}" "${INSTALL_MANIFEST}" \
+    "${RENDERED_PLIST}" "${INSTALLED_PLIST}"
+  note "Reports, delivery receipts, and logs are preserved in ${REPORT_HOME}"
+  if [[ "${APPLY}" -eq 0 ]]; then note "Dry-run only. Rerun with --apply."; fi
+}
+
+case "${ACTION}" in
+  help|"") usage ;;
+  install) install_service ;;
+  start)
+    require_macos_for_apply
+    select_python || die "Python >= 3.11 is required"
+    start_service
+    if [[ "${APPLY}" -eq 0 ]]; then note "Dry-run only. Rerun with --apply."; fi
+    ;;
+  stop)
+    require_macos_for_apply
+    stop_service
+    if [[ "${APPLY}" -eq 0 ]]; then note "Dry-run only. Rerun with --apply."; fi
+    ;;
+  status) show_status ;;
+  doctor) doctor ;;
+  run) run_report ;;
+  uninstall) uninstall_service ;;
+  *) echo "error: unknown command: ${ACTION}" >&2; usage >&2; exit 64 ;;
+esac

@@ -16,7 +16,7 @@ import numpy as np
 import pandas as pd
 
 from coinpilot.broker import PortfolioState, Trade
-from coinpilot.config import AppConfig
+from coinpilot.config import PROBABILITY_SIGNAL_MODES, AppConfig
 from coinpilot.data import candle_data_hash, validate_candles
 from coinpilot.engine import BarExecutionEngine
 from coinpilot.features import FEATURE_COLUMNS, build_feature_dataset
@@ -27,6 +27,8 @@ from coinpilot.strategy import (
     generate_walk_forward_predictions,
     model_config_hash,
     prediction_alignment_hash,
+    trend_breakout_model_id,
+    trend_breakout_scores,
 )
 
 
@@ -151,7 +153,7 @@ def _calculate_metrics(
     )
     diagnostic_scores = (
         predictions.probabilities
-        if predictions.signal_mode == "probability"
+        if predictions.signal_mode in PROBABILITY_SIGNAL_MODES
         else predictions.expected_gross_returns
     )
     oos_mask = (
@@ -223,7 +225,7 @@ def _calculate_metrics(
     valid_signal_count = int(
         (
             predictions.probabilities.notna()
-            if predictions.signal_mode == "probability"
+            if predictions.signal_mode in PROBABILITY_SIGNAL_MODES
             else predictions.expected_net_edges.notna()
         ).loc[signal_window].sum()
     )
@@ -427,14 +429,37 @@ def run_backtest(
         rebuilt_dataset["segment_id"].reset_index(drop=True)
     ):
         raise ValueError("Prediction feature dataset has mismatched gap segments")
-    fit_ids = [fit.model_id for fit in predictions.fits]
     referenced_model_ids = set(predictions.model_ids.dropna().astype(str))
-    if len(fit_ids) != len(set(fit_ids)) or not referenced_model_ids.issubset(
-        set(fit_ids)
-    ):
-        raise ValueError(
-            "Prediction model IDs do not match the recorded model fits"
+    if predictions.signal_mode == "trend_breakout":
+        if predictions.fits or not referenced_model_ids.issubset(
+            {trend_breakout_model_id(config.model)}
+        ):
+            raise ValueError(
+                "Deterministic trend predictions have invalid model provenance"
+            )
+        rebuilt_scores, rebuilt_model_ids = trend_breakout_scores(
+            frame,
+            interval_minutes=config.data.interval_minutes,
+            model_config=config.model,
         )
+        if not np.allclose(
+            predictions.probabilities.to_numpy(dtype=float),
+            rebuilt_scores.to_numpy(dtype=float),
+            rtol=0,
+            atol=0,
+            equal_nan=True,
+        ) or not predictions.model_ids.equals(rebuilt_model_ids):
+            raise ValueError(
+                "Deterministic trend predictions do not match source candles"
+            )
+    else:
+        fit_ids = [fit.model_id for fit in predictions.fits]
+        if len(fit_ids) != len(set(fit_ids)) or not referenced_model_ids.issubset(
+            set(fit_ids)
+        ):
+            raise ValueError(
+                "Prediction model IDs do not match the recorded model fits"
+            )
 
     def utc_boundary(
         value: str | pd.Timestamp | None,

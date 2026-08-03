@@ -10,6 +10,7 @@ def _book(
     *,
     connection: str = "conn-1",
     gap: bool = False,
+    gap_reason: str = "reconnect",
 ) -> dict:
     return {
         "schema_version": 1,
@@ -20,7 +21,7 @@ def _book(
         "received_monotonic_ns": str(ordinal * 100_000_000),
         "monotonic_regression": False,
         "gap_before": gap,
-        "gap_reason": "reconnect" if gap else None,
+        "gap_reason": gap_reason if gap else None,
         "event": {
             "event_type": "orderbook",
             "market": "KRW-BTC",
@@ -89,6 +90,26 @@ def test_gap_resets_trade_window_and_book_warmup() -> None:
     assert after_gap is not None and after_gap.ready is False
     assert after_gap.trade_flow == 0.0
     assert after_gap.warmup_books_seen == 1
+
+
+def test_receive_interval_observation_silence_preserves_warmup() -> None:
+    signal = OnlineDiagnosticSignal(
+        warmup_books=2,
+        trade_flow_window_ms=1_000,
+        model_version="diagnostic-v0",
+    )
+
+    signal.feed(_trade(1, "buy"))
+    ready = signal.feed(_book(2))
+    ready = signal.feed(_book(3))
+    silence = _book(4, gap=True, gap_reason="receive_interval")
+    silence["received_monotonic_ns"] = "2000000000"
+    after_silence = signal.feed(silence)
+
+    assert ready is not None and ready.ready is True
+    assert after_silence is not None and after_silence.ready is True
+    assert after_silence.warmup_books_seen == 3
+    assert after_silence.trade_flow == 0.0
 
 
 def test_duplicate_public_trade_id_is_not_double_counted() -> None:

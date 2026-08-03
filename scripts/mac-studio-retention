@@ -47,7 +47,10 @@ runtime_value() {
 
 RAW_DIR="${APP_HOME}/data/raw"
 BACKUP_DIR="${APP_HOME}/backups"
-LOG_DIR="${COINPILOT_LOG_DIR:-${DEFAULT_LOG_DIR}}"
+LOG_DIR="${COINPILOT_LOG_DIR:-}"
+if [[ -z "${LOG_DIR}" ]]; then
+  LOG_DIR="$(runtime_value COINPILOT_LOG_DIR "${DEFAULT_LOG_DIR}")"
+fi
 RAW_DAYS="$(runtime_value COINPILOT_RETENTION_DAYS 90)"
 BACKUP_DAYS="$(runtime_value COINPILOT_BACKUP_RETENTION_DAYS 35)"
 LOG_DAYS="$(runtime_value COINPILOT_LOG_RETENTION_DAYS 30)"

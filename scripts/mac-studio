@@ -12,6 +12,18 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -P)"
 
 DEFAULT_APP_HOME="${HOME}/Library/Application Support/Coinpilot"
 APP_HOME="${COINPILOT_HOME:-${DEFAULT_APP_HOME}}"
+APP_HOME_EXPLICIT=0
+if [[ -n "${COINPILOT_HOME:-}" ]]; then
+  APP_HOME_EXPLICIT=1
+fi
+INSTANCE="${COINPILOT_INSTANCE:-default}"
+MARKET_OVERRIDE=""
+INITIAL_CASH_OVERRIDE=""
+ORDER_QUOTE_OVERRIDE=""
+SHADOW_MODE_OVERRIDE=""
+WEB_PORT_OVERRIDE=""
+TRANSITION_BACKUP=""
+TRANSITION_VERSION=""
 APPLY=0
 FOLLOW=0
 START_SERVICES=1
@@ -35,6 +47,71 @@ while [[ $# -gt 0 ]]; do
         exit 64
       fi
       APP_HOME="$2"
+      APP_HOME_EXPLICIT=1
+      shift
+      ;;
+    --instance)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --instance requires a slug" >&2
+        exit 64
+      fi
+      INSTANCE="$2"
+      shift
+      ;;
+    --market)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --market requires an exchange market such as KRW-BTC" >&2
+        exit 64
+      fi
+      MARKET_OVERRIDE="$2"
+      shift
+      ;;
+    --initial-cash)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --initial-cash requires a positive integer" >&2
+        exit 64
+      fi
+      INITIAL_CASH_OVERRIDE="$2"
+      shift
+      ;;
+    --order-quote)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --order-quote requires a positive integer" >&2
+        exit 64
+      fi
+      ORDER_QUOTE_OVERRIDE="$2"
+      shift
+      ;;
+    --shadow-mode)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --shadow-mode requires observe or diagnostic" >&2
+        exit 64
+      fi
+      SHADOW_MODE_OVERRIDE="$2"
+      shift
+      ;;
+    --web-port)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --web-port requires a loopback TCP port" >&2
+        exit 64
+      fi
+      WEB_PORT_OVERRIDE="$2"
+      shift
+      ;;
+    --backup)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --backup requires a verified SQLite backup path" >&2
+        exit 64
+      fi
+      TRANSITION_BACKUP="$2"
+      shift
+      ;;
+    --version)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --version requires a 12-character lowercase commit prefix" >&2
+        exit 64
+      fi
+      TRANSITION_VERSION="$2"
       shift
       ;;
     --follow|-f)
@@ -65,11 +142,69 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
+if [[ ! "${INSTANCE}" =~ ^[a-z][a-z0-9-]*$ ]]; then
+  echo "error: --instance must match ^[a-z][a-z0-9-]*$" >&2
+  exit 64
+fi
+if [[ -n "${MARKET_OVERRIDE}" &&
+      ! "${MARKET_OVERRIDE}" =~ ^[A-Z0-9]+-[A-Z0-9]+$ ]]; then
+  echo "error: --market must look like KRW-BTC" >&2
+  exit 64
+fi
+for amount_name in INITIAL_CASH_OVERRIDE ORDER_QUOTE_OVERRIDE; do
+  amount_value="${!amount_name}"
+  if [[ -n "${amount_value}" ]]; then
+    case "${amount_value}" in
+      ''|*[!0-9]*|0)
+        echo "error: ${amount_name} must be a positive integer" >&2
+        exit 64
+        ;;
+    esac
+  fi
+done
+if [[ -n "${INITIAL_CASH_OVERRIDE}" &&
+      -n "${ORDER_QUOTE_OVERRIDE}" &&
+      "${ORDER_QUOTE_OVERRIDE}" -gt "${INITIAL_CASH_OVERRIDE}" ]]; then
+  echo "error: --order-quote cannot exceed --initial-cash" >&2
+  exit 64
+fi
+if [[ -n "${SHADOW_MODE_OVERRIDE}" &&
+      "${SHADOW_MODE_OVERRIDE}" != "observe" &&
+      "${SHADOW_MODE_OVERRIDE}" != "diagnostic" ]]; then
+  echo "error: --shadow-mode requires observe or diagnostic" >&2
+  exit 64
+fi
+if [[ -n "${WEB_PORT_OVERRIDE}" ]]; then
+  case "${WEB_PORT_OVERRIDE}" in
+    ''|*[!0-9]*)
+      echo "error: --web-port must be an integer from 1024 to 65535" >&2
+      exit 64
+      ;;
+  esac
+  if [[ "${WEB_PORT_OVERRIDE}" -lt 1024 || "${WEB_PORT_OVERRIDE}" -gt 65535 ]]; then
+    echo "error: --web-port must be an integer from 1024 to 65535" >&2
+    exit 64
+  fi
+fi
+if [[ -n "${TRANSITION_VERSION}" &&
+      ! "${TRANSITION_VERSION}" =~ ^[0-9a-f]{12}$ ]]; then
+  echo "error: --version must be exactly 12 lowercase hexadecimal characters" >&2
+  exit 64
+fi
+
+if [[ "${INSTANCE}" != "default" && "${APP_HOME_EXPLICIT}" -eq 0 ]]; then
+  APP_HOME="${DEFAULT_APP_HOME}/instances/${INSTANCE}"
+fi
+
 CONFIG_DIR="${APP_HOME}/config"
 DATA_DIR="${APP_HOME}/data"
 RAW_DIR="${DATA_DIR}/raw"
 STATE_DIR="${APP_HOME}/state"
-LOG_DIR="${HOME}/Library/Logs/Coinpilot"
+if [[ "${INSTANCE}" == "default" ]]; then
+  LOG_DIR="${HOME}/Library/Logs/Coinpilot"
+else
+  LOG_DIR="${APP_HOME}/logs"
+fi
 BACKUP_DIR="${APP_HOME}/backups"
 BIN_DIR="${APP_HOME}/bin"
 VENV_DIR="${APP_HOME}/venv"
@@ -78,6 +213,8 @@ LAUNCH_AGENTS_DIR="${HOME}/Library/LaunchAgents"
 CONFIG_PATH="${CONFIG_DIR}/config.toml"
 RUNTIME_ENV="${CONFIG_DIR}/runtime.env"
 PAPER_DB_PATH="${DATA_DIR}/coinpilot.db"
+FORWARD_PAPER_DB_PATH="${DATA_DIR}/coinpilot-c2.db"
+PAPER_CONFIG_PATH="${CONFIG_DIR}/paper.toml"
 SHADOW_DB_PATH="${DATA_DIR}/shadow.db"
 BUILD_LOCK_FILE="${REPO_ROOT}/requirements-build.lock"
 RUNTIME_LOCK_FILE="${REPO_ROOT}/requirements.lock"
@@ -85,8 +222,13 @@ KEYCHAIN_SERVICE="${COINPILOT_SLACK_KEYCHAIN_SERVICE:-coinpilot-slack-webhook}"
 KEYCHAIN_ACCOUNT="${COINPILOT_KEYCHAIN_ACCOUNT:-coinpilot-shadow}"
 MANAGED_SENTINEL=".coinpilot-managed"
 
-LABEL_PREFIX="dev.coinpilot"
-SERVICES=(shadow notifier web external-watchdog backup retention)
+TEMPLATE_LABEL_PREFIX="dev.coinpilot"
+if [[ "${INSTANCE}" == "default" ]]; then
+  LABEL_PREFIX="${TEMPLATE_LABEL_PREFIX}"
+else
+  LABEL_PREFIX="${TEMPLATE_LABEL_PREFIX}.${INSTANCE}"
+fi
+SERVICES=(shadow paper notifier web external-watchdog backup retention)
 PYTHON_BIN=""
 
 usage() {
@@ -110,24 +252,48 @@ Commands:
   slack delete    Delete the Keychain item
   backup          Create and verify a SQLite online backup
   retention       Rotate logs and prune files older than configured limits
+  transition-observe
+                  Switch an approved stopped D2 instance to a new observe ledger
   test            Run shell/static operations tests
 
 Options:
   --apply         Perform changes. Mutating commands are dry-run without this.
   --dry-run       Explicitly preview changes (the default).
   --home PATH     Override the application home.
+  --instance ID   Manage an isolated named instance (for example btc or eth).
+  --market MARKET Set the market when creating a named instance.
+  --initial-cash N
+                  Set simulated starting cash when creating a named instance.
+  --order-quote N Set simulated quote amount per diagnostic entry.
+  --shadow-mode M Set observe or diagnostic mode for a new named instance.
+  --web-port PORT Set the named instance's localhost dashboard port.
+  --backup PATH   Verified terminal online backup for transition-observe.
+  --version HEX   Exact 12-character deployed commit prefix for the new ledger.
   --follow, -f    Follow logs.
   --no-start      Install/render without loading any service.
+
+The optional paper service is disabled by default. It uses config/paper.toml
+and a separate data/coinpilot-c2.db; it never reuses the shadow configuration.
 
 Examples:
   ./scripts/mac-studio slack set --apply
   ./scripts/mac-studio bootstrap --apply
   ./scripts/mac-studio doctor
   ./scripts/mac-studio logs shadow --follow
+  ./scripts/mac-studio bootstrap --instance btc --market KRW-BTC \
+    --initial-cash 5000000 --order-quote 125000 \
+    --shadow-mode diagnostic --web-port 8766 --apply
+  ./scripts/mac-studio status --instance eth
+  ./scripts/mac-studio transition-observe --instance d2-btc \
+    --backup "/path/to/verified-terminal.sqlite" --version a1b2c3d4e5f6
 
 No command installs a system LaunchDaemon, invokes sudo, enables live trading, or
 deletes application data. The user must have an active login session so the
 LaunchAgents and Keychain item are available.
+
+Named instances isolate their config, database, archive journal, backups, logs,
+virtualenv, dashboard port, and LaunchAgent labels. Omitting --instance preserves
+the legacy single-instance paths and labels.
 EOF
 }
 
@@ -173,9 +339,13 @@ require_macos_for_apply() {
 
 select_python() {
   local candidate
+  local brew_python_prefix=""
   if [[ -n "${COINPILOT_PYTHON:-}" ]]; then
     candidate="${COINPILOT_PYTHON}"
-    if [[ -x "${candidate}" ]]; then
+    if [[ -x "${candidate}" ]] &&
+        PYTHONDONTWRITEBYTECODE=1 "${candidate}" -c \
+          'import sys; raise SystemExit(sys.version_info < (3, 11))' \
+          >/dev/null 2>&1; then
       PYTHON_BIN="${candidate}"
       return 0
     fi
@@ -184,10 +354,32 @@ select_python() {
 
   for candidate in \
     "$(command -v python3 2>/dev/null || true)" \
+    "$(command -v python3.12 2>/dev/null || true)"; do
+    if [[ -n "${candidate}" && -x "${candidate}" ]]; then
+      if PYTHONDONTWRITEBYTECODE=1 "${candidate}" -c \
+          'import sys; raise SystemExit(sys.version_info < (3, 11))' \
+          >/dev/null 2>&1; then
+        PYTHON_BIN="${candidate}"
+        return 0
+      fi
+    fi
+  done
+
+  if command -v brew >/dev/null 2>&1; then
+    brew_python_prefix="$(brew --prefix python@3.12 2>/dev/null || true)"
+  fi
+
+  for candidate in \
+    "${brew_python_prefix:+${brew_python_prefix}/bin/python3.12}" \
+    "${brew_python_prefix:+${brew_python_prefix}/libexec/bin/python3}" \
+    "/opt/homebrew/bin/python3.12" \
+    "/usr/local/bin/python3.12" \
     "/opt/homebrew/bin/python3" \
     "/usr/local/bin/python3"; do
     if [[ -n "${candidate}" && -x "${candidate}" ]]; then
-      if "${candidate}" -c 'import sys; raise SystemExit(sys.version_info < (3, 11))' 2>/dev/null; then
+      if PYTHONDONTWRITEBYTECODE=1 "${candidate}" -c \
+          'import sys; raise SystemExit(sys.version_info < (3, 11))' \
+          >/dev/null 2>&1; then
         PYTHON_BIN="${candidate}"
         return 0
       fi
@@ -196,8 +388,17 @@ select_python() {
   return 1
 }
 
+install_homebrew_python() {
+  if [[ "${APPLY}" -eq 1 ]]; then
+    (umask 022; brew install python@3.12)
+  else
+    quote_cmd brew install python@3.12
+  fi
+}
+
 ensure_python() {
   local allow_brew="${1:-0}"
+  local brew_python_prefix=""
   if select_python; then
     note "Python: ${PYTHON_BIN} ($("${PYTHON_BIN}" --version 2>&1))"
     return 0
@@ -205,9 +406,12 @@ ensure_python() {
 
   if [[ "${allow_brew}" -eq 1 ]] && command -v brew >/dev/null 2>&1; then
     note "Python >= 3.11 is missing; existing Homebrew can install python@3.12"
-    run_cmd brew install python@3.12
+    install_homebrew_python
     if [[ "${APPLY}" -eq 0 ]]; then
-      PYTHON_BIN="$(brew --prefix)/bin/python3"
+      brew_python_prefix="$(brew --prefix python@3.12 2>/dev/null || true)"
+      [[ -n "${brew_python_prefix}" ]] ||
+        brew_python_prefix="$(brew --prefix)/opt/python@3.12"
+      PYTHON_BIN="${brew_python_prefix}/bin/python3.12"
       return 0
     fi
     select_python || die "Homebrew completed but Python >= 3.11 was not found"
@@ -235,6 +439,43 @@ runtime_value() {
   else
     printf '%s' "${fallback}"
   fi
+}
+
+probe_dashboard() {
+  local host="$1"
+  local port="$2"
+  local interpreter="${VENV_DIR}/bin/python"
+  [[ -x "${interpreter}" && -f "${CONFIG_PATH}" ]] || return 1
+  "${interpreter}" - "${host}" "${port}" "${CONFIG_PATH}" <<'PY'
+import json
+import pathlib
+import sys
+import tomllib
+import urllib.request
+
+host, port, config_path = sys.argv[1:]
+market = str(
+    tomllib.loads(pathlib.Path(config_path).read_text(encoding="utf-8"))["data"][
+        "market"
+    ]
+)
+try:
+    with urllib.request.urlopen(
+        f"http://{host}:{port}/api/status",
+        timeout=2,
+    ) as response:
+        payload = json.load(response)
+except Exception:
+    raise SystemExit(1)
+if payload.get("market") != market:
+    print(
+        f"dashboard market mismatch: configured={market}, "
+        f"reported={payload.get('market')}",
+        file=sys.stderr,
+    )
+    raise SystemExit(2)
+print(str(payload.get("readiness_reason") or "unknown"))
+PY
 }
 
 is_true() {
@@ -271,17 +512,103 @@ create_layout() {
 
 generate_config() {
   local example="${REPO_ROOT}/config.example.toml"
+  local market="${MARKET_OVERRIDE:-KRW-BTC}"
+  local initial_cash="${INITIAL_CASH_OVERRIDE:-10000000}"
+  local order_quote="${ORDER_QUOTE_OVERRIDE:-250000}"
+  local shadow_mode="${SHADOW_MODE_OVERRIDE:-observe}"
+  local web_port="${WEB_PORT_OVERRIDE:-8765}"
   [[ -f "${example}" ]] || die "missing ${example}"
 
   if [[ -f "${CONFIG_PATH}" ]]; then
     note "Preserving existing config: ${CONFIG_PATH}"
+    if [[ -n "${MARKET_OVERRIDE}${INITIAL_CASH_OVERRIDE}${ORDER_QUOTE_OVERRIDE}${SHADOW_MODE_OVERRIDE}${WEB_PORT_OVERRIDE}" ]]; then
+      "${PYTHON_BIN}" - "${CONFIG_PATH}" "${RUNTIME_ENV}" \
+        "${MARKET_OVERRIDE}" "${INITIAL_CASH_OVERRIDE}" \
+        "${ORDER_QUOTE_OVERRIDE}" "${SHADOW_MODE_OVERRIDE}" \
+        "${WEB_PORT_OVERRIDE}" <<'PY'
+import decimal
+import pathlib
+import sys
+import tomllib
+
+config_path = pathlib.Path(sys.argv[1])
+runtime_path = pathlib.Path(sys.argv[2])
+requested_market, requested_cash, requested_order, requested_mode, requested_port = sys.argv[3:]
+config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+
+checks = []
+if requested_market:
+    checks.append(("--market", str(config["data"]["market"]), requested_market))
+if requested_cash:
+    checks.append(
+        (
+            "--initial-cash",
+            decimal.Decimal(str(config["shadow"]["initial_cash"])),
+            decimal.Decimal(requested_cash),
+        )
+    )
+if requested_order:
+    checks.append(
+        (
+            "--order-quote",
+            decimal.Decimal(str(config["shadow"]["order_quote"])),
+            decimal.Decimal(requested_order),
+        )
+    )
+if requested_mode:
+    checks.append(("--shadow-mode", str(config["shadow"]["mode"]), requested_mode))
+if requested_port:
+    checks.append(("--web-port (config)", int(config["operations"]["port"]), int(requested_port)))
+    runtime = {}
+    if runtime_path.is_file():
+        for line in runtime_path.read_text(encoding="utf-8").splitlines():
+            if line and not line.lstrip().startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                runtime[key] = value
+    checks.append(
+        (
+            "--web-port (runtime)",
+            int(runtime.get("COINPILOT_WEB_PORT", config["operations"]["port"])),
+            int(requested_port),
+        )
+    )
+
+mismatches = [
+    f"{name}: installed={actual!s}, requested={expected!s}"
+    for name, actual, expected in checks
+    if actual != expected
+]
+if mismatches:
+    raise SystemExit(
+        "refusing to overwrite preserved instance configuration; "
+        + "; ".join(mismatches)
+    )
+PY
+    fi
   elif [[ "${APPLY}" -eq 0 ]]; then
+    if [[ "${INSTANCE}" != "default" &&
+          ( -z "${MARKET_OVERRIDE}" ||
+            -z "${INITIAL_CASH_OVERRIDE}" ||
+            -z "${ORDER_QUOTE_OVERRIDE}" ||
+            -z "${SHADOW_MODE_OVERRIDE}" ||
+            -z "${WEB_PORT_OVERRIDE}" ) ]]; then
+      die "new named instances require --market, --initial-cash, --order-quote, --shadow-mode, and --web-port"
+    fi
     quote_cmd "${PYTHON_BIN}" "-c" "generate config without secrets" "${example}" "${CONFIG_PATH}"
   else
+    if [[ "${INSTANCE}" != "default" &&
+          ( -z "${MARKET_OVERRIDE}" ||
+            -z "${INITIAL_CASH_OVERRIDE}" ||
+            -z "${ORDER_QUOTE_OVERRIDE}" ||
+            -z "${SHADOW_MODE_OVERRIDE}" ||
+            -z "${WEB_PORT_OVERRIDE}" ) ]]; then
+      die "new named instances require --market, --initial-cash, --order-quote, --shadow-mode, and --web-port"
+    fi
     note "Generating config without secrets: ${CONFIG_PATH}"
     "${PYTHON_BIN}" - "${example}" "${CONFIG_PATH}" \
       "${PAPER_DB_PATH}" "${SHADOW_DB_PATH}" "${RAW_DIR}" "${BACKUP_DIR}" \
-      "${KEYCHAIN_SERVICE}" "${KEYCHAIN_ACCOUNT}" <<'PY'
+      "${KEYCHAIN_SERVICE}" "${KEYCHAIN_ACCOUNT}" "${market}" \
+      "${initial_cash}" "${order_quote}" "${shadow_mode}" "${web_port}" <<'PY'
 import os
 import pathlib
 import sys
@@ -294,17 +621,28 @@ archive_root = sys.argv[5]
 backup_dir = sys.argv[6]
 keychain_service = sys.argv[7]
 keychain_account = sys.argv[8]
+market = sys.argv[9]
+initial_cash = sys.argv[10]
+order_quote = sys.argv[11]
+shadow_mode = sys.argv[12]
+web_port = sys.argv[13]
 
 def toml_string(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 replacements = {
-    ("data", "database_path"): paper_database,
-    ("shadow", "database_path"): shadow_database,
-    ("shadow", "archive_root"): archive_root,
-    ("operations", "backup_dir"): backup_dir,
-    ("operations", "keychain_service"): keychain_service,
-    ("operations", "keychain_account"): keychain_account,
+    ("data", "market"): toml_string(market),
+    ("data", "database_path"): toml_string(paper_database),
+    ("risk", "initial_cash"): initial_cash,
+    ("shadow", "mode"): toml_string(shadow_mode),
+    ("shadow", "database_path"): toml_string(shadow_database),
+    ("shadow", "archive_root"): toml_string(archive_root),
+    ("shadow", "initial_cash"): initial_cash,
+    ("shadow", "order_quote"): order_quote,
+    ("operations", "port"): web_port,
+    ("operations", "backup_dir"): toml_string(backup_dir),
+    ("operations", "keychain_service"): toml_string(keychain_service),
+    ("operations", "keychain_account"): toml_string(keychain_account),
 }
 found = set()
 section = ""
@@ -317,7 +655,7 @@ for line in source.read_text(encoding="utf-8").splitlines():
         key = line.split("=", 1)[0].strip()
         pair = (section, key)
         if pair in replacements:
-            line = f"{key} = {toml_string(replacements[pair])}"
+            line = f"{key} = {replacements[pair]}"
             found.add(pair)
     output.append(line)
 missing = sorted(set(replacements) - found)
@@ -337,7 +675,7 @@ PY
     quote_cmd "${PYTHON_BIN}" "-c" "generate runtime.env without secrets" "${RUNTIME_ENV}"
   else
     note "Generating runtime settings without secrets: ${RUNTIME_ENV}"
-    "${PYTHON_BIN}" - "${RUNTIME_ENV}" <<'PY'
+    "${PYTHON_BIN}" - "${RUNTIME_ENV}" "${web_port}" "${LOG_DIR}" <<'PY'
 import os
 import pathlib
 import sys
@@ -345,11 +683,20 @@ import sys
 destination = pathlib.Path(sys.argv[1])
 values = {
     "COINPILOT_WEB_HOST": "127.0.0.1",
-    "COINPILOT_WEB_PORT": "8765",
+    "COINPILOT_WEB_PORT": sys.argv[2],
+    "COINPILOT_LOG_DIR": sys.argv[3],
     "COINPILOT_ENABLE_SHADOW": "1",
+    "COINPILOT_ENABLE_PAPER": "0",
     "COINPILOT_ENABLE_NOTIFIER": "1",
     "COINPILOT_ENABLE_WEB": "1",
     "COINPILOT_ENABLE_WATCHDOG": "1",
+    "COINPILOT_SLACK_SUMMARY_SECONDS": "3600",
+    "COINPILOT_SLACK_SUMMARY_GRACE_SECONDS": "15",
+    "COINPILOT_BOUNDED_SHADOW": "0",
+    "COINPILOT_SHADOW_COOLDOWN_SECONDS": "3600",
+    "COINPILOT_SHADOW_MAX_ROUND_TRIPS_PER_DAY": "24",
+    "COINPILOT_SHADOW_RESERVE_FULL_ORDER_LOSS": "1",
+    "COINPILOT_SHADOW_EXECUTION_SPREAD_RECHECK": "1",
     "COINPILOT_RETENTION_DAYS": "90",
     "COINPILOT_BACKUP_RETENTION_DAYS": "35",
     "COINPILOT_LOG_RETENTION_DAYS": "30",
@@ -371,6 +718,213 @@ PY
   fi
 }
 
+validate_named_instance_config() {
+  [[ "${INSTANCE}" != "default" ]] || return 0
+  [[ -f "${CONFIG_PATH}" && -f "${RUNTIME_ENV}" ]] || return 0
+  [[ -n "${PYTHON_BIN}" && -x "${PYTHON_BIN}" ]] || return 1
+
+  "${PYTHON_BIN}" - "${APP_HOME}" "${CONFIG_PATH}" "${RUNTIME_ENV}" \
+    "${PAPER_DB_PATH}" "${SHADOW_DB_PATH}" "${RAW_DIR}" "${BACKUP_DIR}" <<'PY'
+import decimal
+import pathlib
+import re
+import sys
+import tomllib
+
+app_home = pathlib.Path(sys.argv[1]).expanduser().absolute()
+config_path = pathlib.Path(sys.argv[2]).expanduser().absolute()
+runtime_path = pathlib.Path(sys.argv[3]).expanduser().absolute()
+expected_paths = {
+    ("data", "database_path"): pathlib.Path(sys.argv[4]).expanduser().absolute(),
+    ("shadow", "archive_root"): pathlib.Path(sys.argv[6]).expanduser().absolute(),
+    ("operations", "backup_dir"): pathlib.Path(sys.argv[7]).expanduser().absolute(),
+}
+config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+errors = []
+default_shadow_database = pathlib.Path(sys.argv[5]).expanduser().absolute()
+data_dir = default_shadow_database.parent
+configured_shadow = pathlib.Path(str(config["shadow"]["database_path"])).expanduser()
+if not configured_shadow.is_absolute():
+    errors.append("shadow.database_path must be absolute")
+shadow_database = configured_shadow.absolute()
+
+def has_symlink_component(path: pathlib.Path) -> bool:
+    current = path
+    while True:
+        # is_symlink() also catches a dangling final component.  Requiring
+        # exists() here would let a broken link redirect SQLite creation.
+        if current.is_symlink():
+            return True
+        if current == current.parent:
+            return False
+        current = current.parent
+
+for path in (
+    app_home,
+    config_path,
+    runtime_path,
+    *expected_paths.values(),
+    shadow_database,
+):
+    if has_symlink_component(path):
+        errors.append(f"symlinked managed path: {path}")
+
+for (section, key), expected in expected_paths.items():
+    actual = pathlib.Path(str(config[section][key])).expanduser().absolute()
+    if actual != expected:
+        errors.append(
+            f"{section}.{key} must be {expected}, found {actual}"
+        )
+    try:
+        actual.relative_to(app_home)
+    except ValueError:
+        errors.append(f"{section}.{key} escapes instance home: {actual}")
+
+if shadow_database.parent != data_dir:
+    errors.append(
+        f"shadow.database_path must be directly inside {data_dir}, "
+        f"found {shadow_database}"
+    )
+if not re.fullmatch(
+    r"shadow(?:-[A-Za-z0-9][A-Za-z0-9._-]*)?\.db",
+    shadow_database.name,
+):
+    errors.append(
+        "shadow.database_path filename must be shadow.db or shadow-<version>.db"
+    )
+if shadow_database.exists() and not shadow_database.is_file():
+    errors.append(
+        f"shadow.database_path must be a regular file when it exists: "
+        f"{shadow_database}"
+    )
+elif shadow_database.exists() and shadow_database.stat().st_nlink != 1:
+    errors.append(
+        f"shadow.database_path must not be hard-linked: {shadow_database}"
+    )
+try:
+    shadow_database.relative_to(app_home)
+except ValueError:
+    errors.append(f"shadow.database_path escapes instance home: {shadow_database}")
+if shadow_database == expected_paths[("data", "database_path")]:
+    errors.append("shadow.database_path must not reuse data.database_path")
+
+market = str(config["data"]["market"])
+if not re.fullmatch(r"[A-Z0-9]+-[A-Z0-9]+", market):
+    errors.append(f"invalid data.market: {market}")
+mode = str(config["shadow"]["mode"])
+if mode not in {"observe", "diagnostic"}:
+    errors.append(f"invalid shadow.mode: {mode}")
+
+initial_cash = decimal.Decimal(str(config["shadow"]["initial_cash"]))
+risk_cash = decimal.Decimal(str(config["risk"]["initial_cash"]))
+order_quote = decimal.Decimal(str(config["shadow"]["order_quote"]))
+if initial_cash <= 0 or risk_cash != initial_cash:
+    errors.append("risk.initial_cash and shadow.initial_cash must match and be positive")
+if order_quote <= 0 or order_quote > initial_cash:
+    errors.append("shadow.order_quote must be positive and no greater than initial cash")
+
+runtime = {}
+for line in runtime_path.read_text(encoding="utf-8").splitlines():
+    if line and not line.lstrip().startswith("#") and "=" in line:
+        key, value = line.split("=", 1)
+        runtime[key] = value
+config_host = str(config["operations"]["bind_host"])
+runtime_host = runtime.get("COINPILOT_WEB_HOST")
+if config_host != "127.0.0.1" or runtime_host != "127.0.0.1":
+    errors.append("dashboard host must be 127.0.0.1 in config and runtime")
+config_port = int(config["operations"]["port"])
+try:
+    runtime_port = int(runtime["COINPILOT_WEB_PORT"])
+except (KeyError, ValueError):
+    runtime_port = -1
+if config_port != runtime_port or not 1024 <= config_port <= 65535:
+    errors.append("config and runtime dashboard ports must match and be 1024..65535")
+runtime_log = pathlib.Path(runtime.get("COINPILOT_LOG_DIR", "")).expanduser().absolute()
+expected_log = app_home / "logs"
+if runtime_log != expected_log:
+    errors.append(f"runtime log directory must be {expected_log}, found {runtime_log}")
+
+if errors:
+    raise SystemExit("; ".join(errors))
+PY
+}
+
+named_instance_port_is_unique() {
+  local wanted
+  local sibling_runtime
+  local sibling_home
+  local sibling_port
+  [[ "${INSTANCE}" != "default" ]] || return 0
+  [[ -f "${RUNTIME_ENV}" ]] || return 0
+  wanted="$(runtime_value COINPILOT_WEB_PORT 8765)"
+  for sibling_runtime in "${DEFAULT_APP_HOME}/instances"/*/config/runtime.env; do
+    [[ -f "${sibling_runtime}" ]] || continue
+    sibling_home="$(cd "$(dirname "${sibling_runtime}")/.." && pwd -P)"
+    [[ "${sibling_home}" != "$(cd "${APP_HOME}" && pwd -P)" ]] || continue
+    sibling_port="$(awk -F= '
+      $0 !~ /^[[:space:]]*#/ && $1 == "COINPILOT_WEB_PORT" {
+        sub(/^[^=]*=/, "")
+        print
+        exit
+      }
+    ' "${sibling_runtime}")"
+    if [[ -n "${sibling_port}" && "${sibling_port}" == "${wanted}" ]]; then
+      warn "dashboard port ${wanted} is already assigned to ${sibling_home}"
+      return 1
+    fi
+  done
+}
+
+validate_bounded_shadow_profile() {
+  local enabled
+  local model_version
+  [[ -x "${VENV_DIR}/bin/python" && -f "${CONFIG_PATH}" ]] || return 1
+  enabled="$(runtime_value COINPILOT_BOUNDED_SHADOW 0)"
+  model_version="$("${VENV_DIR}/bin/python" - "${CONFIG_PATH}" <<'PY'
+import pathlib
+import sys
+import tomllib
+
+config = tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(str(config.get("shadow", {}).get("model_version", "")))
+PY
+)" || return 1
+  case "${enabled}" in
+    1|true|TRUE|yes|YES|on|ON)
+      [[ -x "${BIN_DIR}/coinpilot-bounded-shadow" ]] || return 1
+      "${VENV_DIR}/bin/python" "${BIN_DIR}/coinpilot-bounded-shadow" \
+        --config "${CONFIG_PATH}" \
+        --cooldown-seconds \
+          "$(runtime_value COINPILOT_SHADOW_COOLDOWN_SECONDS 3600)" \
+        --max-round-trips-per-day \
+          "$(runtime_value COINPILOT_SHADOW_MAX_ROUND_TRIPS_PER_DAY 24)" \
+        --reserve-full-order-loss \
+          "$(runtime_value COINPILOT_SHADOW_RESERVE_FULL_ORDER_LOSS 1)" \
+        --execution-spread-recheck \
+          "$(runtime_value COINPILOT_SHADOW_EXECUTION_SPREAD_RECHECK 1)" \
+        --audit-dir "${STATE_DIR}" \
+        --validate-only >/dev/null
+      ;;
+    0|false|FALSE|no|NO|off|OFF)
+      [[ "${model_version}" != diagnostic-bounded-* ]]
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+guard_named_instance_start() {
+  [[ "${INSTANCE}" != "default" ]] || return 0
+  select_python || die "Python >= 3.11 is required to validate this instance"
+  validate_named_instance_config ||
+    die "named instance configuration failed isolation validation"
+  named_instance_port_is_unique ||
+    die "named instance dashboard port is not unique"
+  validate_bounded_shadow_profile ||
+    die "bounded shadow profile is missing, disabled, or unsafe"
+}
+
 install_runtime() {
   [[ -f "${BUILD_LOCK_FILE}" ]] || die "missing build lock: ${BUILD_LOCK_FILE}"
   [[ -f "${RUNTIME_LOCK_FILE}" ]] || die "missing runtime lock: ${RUNTIME_LOCK_FILE}"
@@ -380,14 +934,30 @@ install_runtime() {
     --disable-pip-version-check --requirement "${BUILD_LOCK_FILE}"
   run_cmd "${VENV_DIR}/bin/python" -m pip install \
     --disable-pip-version-check --requirement "${RUNTIME_LOCK_FILE}"
-  run_cmd "${VENV_DIR}/bin/python" -m pip install \
-    --disable-pip-version-check --no-deps --no-build-isolation --editable "${REPO_ROOT}"
+  if [[ "${INSTANCE}" == "default" ]]; then
+    run_cmd "${VENV_DIR}/bin/python" -m pip install \
+      --disable-pip-version-check --no-deps --no-build-isolation \
+      --editable "${REPO_ROOT}"
+  else
+    # Named instances receive an immutable source copy in their own venv.
+    # A working-tree edit or another instance's update cannot change the code
+    # they execute on their next automatic restart.
+    run_cmd "${VENV_DIR}/bin/python" -m pip install \
+      --disable-pip-version-check --no-deps --no-build-isolation \
+      --force-reinstall "${REPO_ROOT}"
+  fi
 }
 
 install_helpers() {
   note "Installing stable service helpers"
   run_cmd install -m 0755 "${REPO_ROOT}/scripts/coinpilot-service.sh" \
     "${BIN_DIR}/coinpilot-service"
+  run_cmd install -m 0755 "${REPO_ROOT}/scripts/coinpilot_hourly_notifier.py" \
+    "${BIN_DIR}/coinpilot-hourly-notifier"
+  run_cmd install -m 0755 "${REPO_ROOT}/scripts/coinpilot_bounded_shadow.py" \
+    "${BIN_DIR}/coinpilot-bounded-shadow"
+  run_cmd install -m 0755 "${REPO_ROOT}/scripts/manage_c2_forward_configs.py" \
+    "${BIN_DIR}/coinpilot-c2-config"
   run_cmd install -m 0755 "${REPO_ROOT}/scripts/mac-studio-backup" \
     "${BIN_DIR}/coinpilot-backup"
   run_cmd install -m 0755 "${REPO_ROOT}/scripts/mac-studio-retention" \
@@ -404,7 +974,7 @@ install_helpers() {
 
 render_plist() {
   local service="$1"
-  local template="${REPO_ROOT}/ops/launchd/${LABEL_PREFIX}.${service}.plist.in"
+  local template="${REPO_ROOT}/ops/launchd/${TEMPLATE_LABEL_PREFIX}.${service}.plist.in"
   local rendered="${RENDERED_LAUNCHD_DIR}/${LABEL_PREFIX}.${service}.plist"
   local installed="${LAUNCH_AGENTS_DIR}/${LABEL_PREFIX}.${service}.plist"
   [[ -f "${template}" ]] || die "missing launchd template: ${template}"
@@ -481,6 +1051,96 @@ service_label() {
   printf '%s.%s' "${LABEL_PREFIX}" "$1"
 }
 
+service_target() {
+  local service="$1"
+  local domain
+  domain="$(launch_domain 2>/dev/null || true)"
+  printf '%s/%s' "${domain:-gui/$(id -u)}" "$(service_label "${service}")"
+}
+
+LAUNCHCTL_ERROR=""
+LAUNCHD_DISABLED_OVERRIDES=""
+LAUNCHD_DISABLED_OVERRIDES_AVAILABLE=0
+
+set_service_launchd_enabled() {
+  local service="$1"
+  local enabled="$2"
+  local action
+  local launch_error=""
+  local target
+  LAUNCHCTL_ERROR=""
+  if [[ "${enabled}" -eq 1 ]]; then
+    action="enable"
+  else
+    action="disable"
+  fi
+  target="$(service_target "${service}")"
+  if [[ "${APPLY}" -eq 0 ]]; then
+    quote_cmd launchctl "${action}" "${target}"
+  elif ! launch_error="$(launchctl "${action}" "${target}" 2>&1)"; then
+    LAUNCHCTL_ERROR="launchctl ${action} failed for ${service}: ${launch_error}"
+    return 1
+  fi
+}
+
+refresh_launchd_disabled_overrides() {
+  local domain="$1"
+  LAUNCHD_DISABLED_OVERRIDES=""
+  LAUNCHD_DISABLED_OVERRIDES_AVAILABLE=0
+  [[ -n "${domain}" ]] || return 0
+  if LAUNCHD_DISABLED_OVERRIDES="$(
+      LC_ALL=C launchctl print-disabled "${domain}" 2>/dev/null
+    )"; then
+    LAUNCHD_DISABLED_OVERRIDES_AVAILABLE=1
+  fi
+}
+
+service_launchd_override_state() {
+  local service="$1"
+  local label
+  if [[ "${LAUNCHD_DISABLED_OVERRIDES_AVAILABLE}" -ne 1 ]]; then
+    printf '%s' unknown
+    return 0
+  fi
+  label="$(service_label "${service}")"
+  printf '%s\n' "${LAUNCHD_DISABLED_OVERRIDES}" | LC_ALL=C awk \
+    -v wanted="${label}" '
+function trim(value) {
+  sub(/^[[:space:]]+/, "", value)
+  sub(/[[:space:]]+$/, "", value)
+  return value
+}
+{
+  line = $0
+  sub(/\r$/, "", line)
+  separator = index(line, "=>")
+  if (!separator) next
+  key = trim(substr(line, 1, separator - 1))
+  value = trim(substr(line, separator + 2))
+  if (length(key) >= 2 && substr(key, 1, 1) == "\"" &&
+      substr(key, length(key), 1) == "\"") {
+    key = substr(key, 2, length(key) - 2)
+  }
+  if (key != wanted) next
+  sub(/[[:space:]]*[,;][[:space:]]*$/, "", value)
+  value = trim(value)
+  matches += 1
+  if (matches > 1) {
+    state = "unknown"
+  } else if (value == "disabled" || value == "true" || value == "1") {
+    state = "disabled"
+  } else if (value == "enabled" || value == "false" || value == "0") {
+    state = "enabled"
+  } else {
+    state = "unknown"
+  }
+}
+END {
+  if (!matches) print "unset"
+  else print state
+}'
+}
+
 service_is_loaded() {
   local service="$1"
   local domain
@@ -489,9 +1149,43 @@ service_is_loaded() {
   launchctl print "${domain}/$(service_label "${service}")" >/dev/null 2>&1
 }
 
+service_is_running() {
+  local service="$1"
+  local domain
+  local job
+  local pid
+  domain="$(launch_domain 2>/dev/null || true)"
+  [[ -n "${domain}" ]] || return 1
+  job="$(launchctl print "${domain}/$(service_label "${service}")" 2>/dev/null)" || return 1
+  printf '%s\n' "${job}" | grep -Eq '^[[:space:]]*state = running[[:space:]]*$' || return 1
+  pid="$(printf '%s\n' "${job}" | awk '
+    /^[[:space:]]*pid = [0-9]+[[:space:]]*$/ { print $3; exit }
+  ')"
+  case "${pid}" in
+    ''|*[!0-9]*|0) return 1 ;;
+  esac
+  kill -0 "${pid}" 2>/dev/null
+}
+
+wait_for_service_unloaded() {
+  local service="$1"
+  local attempt
+  for attempt in {1..30}; do
+    if ! service_is_loaded "${service}"; then
+      return 0
+    fi
+    if [[ "${attempt}" -lt 30 ]]; then
+      /bin/sleep 1
+    fi
+  done
+  return 1
+}
+
 bootout_service() {
   local service="$1"
   local domain
+  local launch_error=""
+  LAUNCHCTL_ERROR=""
   domain="$(launch_domain 2>/dev/null || true)"
   if [[ -z "${domain}" ]]; then
     if [[ "${APPLY}" -eq 1 ]]; then
@@ -504,32 +1198,54 @@ bootout_service() {
   if [[ "${APPLY}" -eq 0 ]]; then
     quote_cmd launchctl bootout "${domain}/$(service_label "${service}")"
   elif service_is_loaded "${service}"; then
-    launchctl bootout "${domain}/$(service_label "${service}")"
+    if launch_error="$(launchctl bootout \
+        "${domain}/$(service_label "${service}")" 2>&1)"; then
+      if ! wait_for_service_unloaded "${service}"; then
+        LAUNCHCTL_ERROR="launchctl bootout did not finish for ${service} within 30 seconds"
+        return 1
+      fi
+    elif service_is_loaded "${service}"; then
+      LAUNCHCTL_ERROR="launchctl bootout failed for ${service}: ${launch_error}"
+      return 1
+    fi
   fi
 }
 
 bootstrap_service() {
   local service="$1"
-  local kick="${2:-0}"
+  local attempt
   local domain
+  local launch_error=""
   local plist
   domain="$(launch_domain 2>/dev/null || true)"
   plist="$(plist_path "${service}")"
   if [[ "${APPLY}" -eq 0 ]]; then
+    bootout_service "${service}" || die "${LAUNCHCTL_ERROR}"
+    set_service_launchd_enabled "${service}" 1 || die "${LAUNCHCTL_ERROR}"
     quote_cmd launchctl bootstrap "gui/$(id -u)" "${plist}"
-    if [[ "${kick}" -eq 1 ]]; then
-      quote_cmd launchctl kickstart -k "gui/$(id -u)/$(service_label "${service}")"
-    fi
     return 0
   fi
   [[ -n "${domain}" ]] || die "no launchd user domain; log in as $(id -un) and rerun"
   [[ -f "${plist}" ]] || die "missing installed plist: ${plist}"
-  bootout_service "${service}"
-  launchctl enable "${domain}/$(service_label "${service}")" >/dev/null 2>&1 || true
-  launchctl bootstrap "${domain}" "${plist}"
-  if [[ "${kick}" -eq 1 ]]; then
-    launchctl kickstart -k "${domain}/$(service_label "${service}")"
-  fi
+  bootout_service "${service}" || die "${LAUNCHCTL_ERROR}"
+  set_service_launchd_enabled "${service}" 1 || die "${LAUNCHCTL_ERROR}"
+  for attempt in 1 2 3 4 5; do
+    if launch_error="$(launchctl bootstrap "${domain}" "${plist}" 2>&1)"; then
+      # launchctl can acknowledge bootstrap before an earlier asynchronous
+      # bootout has fully settled. Verify the replacement survives that edge.
+      /bin/sleep 1
+      if service_is_loaded "${service}"; then
+        return 0
+      fi
+      launch_error="bootstrap returned success but ${service} did not remain loaded"
+    elif service_is_loaded "${service}"; then
+      return 0
+    fi
+    if [[ "${attempt}" -lt 5 ]]; then
+      /bin/sleep 1
+    fi
+  done
+  die "launchctl bootstrap failed for ${service}: ${launch_error}"
 }
 
 keychain_has_slack() {
@@ -548,11 +1264,246 @@ cli_has_shadow_commands() {
     printf '%s' "${help}" | grep -q 'shadow-watchdog'
 }
 
+cli_has_paper_commands() {
+  local help
+  [[ -x "${VENV_DIR}/bin/coinpilot" ]] || return 1
+  help="$("${VENV_DIR}/bin/coinpilot" --help 2>&1 || true)"
+  printf '%s' "${help}" | grep -q 'paper' &&
+    printf '%s' "${help}" | grep -q 'status'
+}
+
+validate_paper_config() {
+  local interpreter="${VENV_DIR}/bin/python"
+  [[ -x "${interpreter}" && -f "${PAPER_CONFIG_PATH}" && -f "${CONFIG_PATH}" ]] || return 1
+  "${interpreter}" - "${PAPER_CONFIG_PATH}" "${CONFIG_PATH}" \
+    "${APP_HOME}" "${FORWARD_PAPER_DB_PATH}" <<'PY'
+import pathlib
+import re
+import sys
+import tomllib
+
+from coinpilot.config import load_config
+
+paper_path = pathlib.Path(sys.argv[1]).expanduser().absolute()
+shadow_path = pathlib.Path(sys.argv[2]).expanduser().absolute()
+app_home = pathlib.Path(sys.argv[3]).expanduser().absolute()
+expected_database = pathlib.Path(sys.argv[4]).expanduser().absolute()
+errors = []
+
+def has_symlink_component(path: pathlib.Path) -> bool:
+    current = path
+    while True:
+        if current.exists() and current.is_symlink():
+            return True
+        if current == current.parent:
+            return False
+        current = current.parent
+
+for path in (paper_path, expected_database):
+    if has_symlink_component(path):
+        errors.append(f"symlinked paper path: {path}")
+
+expected_config = app_home / "config" / "paper.toml"
+if paper_path != expected_config:
+    errors.append(f"paper config must be {expected_config}, found {paper_path}")
+
+try:
+    paper = load_config(paper_path)
+except Exception as exc:
+    errors.append(f"paper config is invalid: {type(exc).__name__}: {exc}")
+else:
+    database = pathlib.Path(paper.data.database_path).expanduser().absolute()
+    if database != expected_database:
+        errors.append(
+            f"paper database must be {expected_database}, found {database}"
+        )
+    try:
+        database.relative_to(app_home / "data")
+    except ValueError:
+        errors.append(f"paper database escapes instance data directory: {database}")
+    if not re.fullmatch(r"[A-Z0-9]+-[A-Z0-9]+", paper.data.market):
+        errors.append(f"invalid paper market: {paper.data.market}")
+    shadow = tomllib.loads(shadow_path.read_text(encoding="utf-8"))
+    shadow_market = str(shadow["data"]["market"])
+    if paper.data.market != shadow_market:
+        errors.append(
+            f"paper market must match instance market {shadow_market}, "
+            f"found {paper.data.market}"
+        )
+    if paper.data.api_base_url != "https://api.upbit.com":
+        errors.append("paper data source must be the public https://api.upbit.com API")
+    expected_policy = {
+        "data.interval_minutes": (paper.data.interval_minutes, 60),
+        "model.signal_mode": (paper.model.signal_mode, "trend_breakout"),
+        "model.horizon_bars": (paper.model.horizon_bars, 336),
+        "model.min_train_samples": (paper.model.min_train_samples, 500),
+        "model.train_window": (paper.model.train_window, 1500),
+        "model.retrain_every": (paper.model.retrain_every, 24),
+        "model.entry_probability": (paper.model.entry_probability, 0.58),
+        "model.exit_probability": (paper.model.exit_probability, 0.48),
+        "model.minimum_edge_pct": (paper.model.minimum_edge_pct, 0.001),
+        "model.l2": (paper.model.l2, 0.01),
+        "model.learning_rate": (paper.model.learning_rate, 0.08),
+        "model.max_iterations": (paper.model.max_iterations, 250),
+        "model.calibration_window": (paper.model.calibration_window, 240),
+        "model.calibration_min_samples": (
+            paper.model.calibration_min_samples,
+            120,
+        ),
+        "model.calibration_uncertainty_z": (
+            paper.model.calibration_uncertainty_z,
+            1.0,
+        ),
+        "model.target_clip_quantile": (paper.model.target_clip_quantile, 0.01),
+        "model.regime_sma_window": (paper.model.regime_sma_window, 168),
+        "model.regime_sma_gap_min": (paper.model.regime_sma_gap_min, -1.0),
+        "model.breakout_entry_window": (paper.model.breakout_entry_window, 336),
+        "model.breakout_exit_window": (paper.model.breakout_exit_window, 168),
+        "risk.initial_cash": (paper.risk.initial_cash, 2_500_000.0),
+        "risk.risk_per_trade": (paper.risk.risk_per_trade, 0.0075),
+        "risk.max_position_fraction": (paper.risk.max_position_fraction, 0.50),
+        "risk.atr_stop_multiple": (paper.risk.atr_stop_multiple, 2.0),
+        "risk.minimum_stop_pct": (paper.risk.minimum_stop_pct, 0.01),
+        "risk.maximum_stop_pct": (paper.risk.maximum_stop_pct, 0.08),
+        "risk.trailing_stop_pct": (paper.risk.trailing_stop_pct, 0.08),
+        "risk.max_strategy_drawdown_pct": (
+            paper.risk.max_strategy_drawdown_pct,
+            0.15,
+        ),
+        "risk.fee_rate": (paper.risk.fee_rate, 0.0005),
+        "risk.slippage_bps": (paper.risk.slippage_bps, 5.0),
+        "risk.cooldown_bars": (paper.risk.cooldown_bars, 6),
+        "risk.minimum_order_quote": (paper.risk.minimum_order_quote, 5000.0),
+        "paper.history_candles": (paper.paper.history_candles, 2500),
+        "paper.poll_seconds": (paper.paper.poll_seconds, 30),
+        "paper.max_signal_delay_seconds": (
+            paper.paper.max_signal_delay_seconds,
+            120,
+        ),
+        "paper.max_ticker_age_seconds": (paper.paper.max_ticker_age_seconds, 60),
+    }
+    for name, (actual, expected) in expected_policy.items():
+        if actual != expected:
+            errors.append(f"frozen C2 {name} must be {expected}, found {actual}")
+    expected_account = f"c2-forward-v1-{paper.data.market.lower()}"
+    if paper.paper.account_name != expected_account:
+        errors.append(
+            f"paper.account_name must be {expected_account}, "
+            f"found {paper.paper.account_name}"
+        )
+
+if errors:
+    raise SystemExit("; ".join(errors))
+PY
+  local market
+  local manager="${REPO_ROOT}/scripts/manage_c2_forward_configs.py"
+  local installed_guard="${BIN_DIR}/coinpilot-c2-config"
+  local installed_package_root
+  [[ -f "${manager}" ]] || return 1
+  [[ -x "${installed_guard}" ]] || return 1
+  market="$("${interpreter}" - "${CONFIG_PATH}" <<'PY'
+import pathlib
+import sys
+import tomllib
+
+print(tomllib.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))["data"]["market"])
+PY
+)" || return 1
+  PYTHONPATH="${REPO_ROOT}/src" "${interpreter}" "${manager}" check \
+    --market "${market}" \
+    --app-home "${APP_HOME}" \
+    --output "${PAPER_CONFIG_PATH}" >/dev/null || return 1
+  installed_package_root="$("${interpreter}" - <<'PY'
+import importlib.util
+import pathlib
+
+spec = importlib.util.find_spec("coinpilot")
+if spec is None or not spec.submodule_search_locations:
+    raise SystemExit("installed coinpilot package is unavailable")
+print(pathlib.Path(next(iter(spec.submodule_search_locations))).resolve())
+PY
+)" || return 1
+  "${interpreter}" "${installed_guard}" verify-installed \
+    --config "${PAPER_CONFIG_PATH}" \
+    --manifest "${CONFIG_DIR}/paper.manifest.json" \
+    --installed-package-root "${installed_package_root}" >/dev/null
+}
+
+probe_paper_status() {
+  local interpreter="${VENV_DIR}/bin/python"
+  [[ -x "${interpreter}" && -f "${PAPER_CONFIG_PATH}" ]] || return 1
+  "${interpreter}" - "${PAPER_CONFIG_PATH}" <<'PY'
+import datetime as dt
+import json
+import pathlib
+import sqlite3
+import sys
+
+from coinpilot.config import load_config
+from coinpilot.broker import HALT_ACTIVE
+from coinpilot.paper import (
+    PAPER_SCHEMA_VERSION,
+    paper_account_key,
+    paper_config_fingerprint,
+)
+
+config = load_config(sys.argv[1])
+database = pathlib.Path(config.data.database_path).resolve()
+if not database.is_file():
+    raise SystemExit(1)
+connection = sqlite3.connect(
+    f"file:{database.as_posix()}?mode=ro", uri=True, timeout=2
+)
+try:
+    row = connection.execute(
+        "SELECT state_json FROM paper_state WHERE account_key = ?",
+        (paper_account_key(config),),
+    ).fetchone()
+finally:
+    connection.close()
+if row is None:
+    raise SystemExit(1)
+state = json.loads(row[0])
+if (
+    state.get("market") != config.data.market
+    or state.get("schema_version") != PAPER_SCHEMA_VERSION
+    or state.get("config_fingerprint") != paper_config_fingerprint(config)
+    or state.get("halt_state") != HALT_ACTIVE
+    or int(state.get("revision", 0)) < 1
+):
+    raise SystemExit(1)
+updated_at = state.get("updated_at")
+if not isinstance(updated_at, str):
+    raise SystemExit(1)
+updated = dt.datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+if updated.tzinfo is None:
+    raise SystemExit(1)
+maximum_age = max(config.paper.poll_seconds * 5, 300)
+age = (dt.datetime.now(dt.timezone.utc) - updated).total_seconds()
+if age < -5 or age > maximum_age:
+    raise SystemExit(1)
+print(
+    "market={market} cash={cash:.2f} quantity={quantity:.12g} "
+    "realized_pnl={realized:.2f} state={halt} revision={revision} "
+    "updated_at={updated}".format(
+        market=state["market"],
+        cash=float(state["cash"]),
+        quantity=float(state.get("quantity", 0.0)),
+        realized=float(state.get("realized_pnl", 0.0)),
+        halt=state["halt_state"],
+        revision=int(state["revision"]),
+        updated=updated_at,
+    )
+)
+PY
+}
+
 service_enabled() {
   local service="$1"
   local setting
   case "${service}" in
     shadow) setting="$(runtime_value COINPILOT_ENABLE_SHADOW 1)" ;;
+    paper) setting="$(runtime_value COINPILOT_ENABLE_PAPER 0)" ;;
     notifier) setting="$(runtime_value COINPILOT_ENABLE_NOTIFIER 1)" ;;
     web) setting="$(runtime_value COINPILOT_ENABLE_WEB 1)" ;;
     external-watchdog) setting="$(runtime_value COINPILOT_ENABLE_WATCHDOG 1)" ;;
@@ -562,47 +1513,106 @@ service_enabled() {
   is_true "${setting}"
 }
 
+service_should_be_active() {
+  local service="$1"
+  local check_keychain="${2:-1}"
+  service_enabled "${service}" || return 1
+  if [[ "${service}" == "notifier" && "${check_keychain}" -eq 1 ]] &&
+      ! keychain_has_slack; then
+    return 1
+  fi
+}
+
+service_disable_reason() {
+  local service="$1"
+  local check_keychain="${2:-1}"
+  if ! service_enabled "${service}"; then
+    printf '%s' config-disabled
+  elif [[ "${service}" == "notifier" && "${check_keychain}" -eq 1 ]] &&
+      ! keychain_has_slack; then
+    printf '%s' missing-keychain
+  else
+    return 1
+  fi
+}
+
 load_configured_services() {
   local service
+  local disable_reason
+  local reconciliation_errors=""
+  local -a services_to_start=()
+
+  # Reconcile every service that must remain down before bootstrapping any
+  # enabled service. A failure to start an earlier service must never leave a
+  # later configured-disabled job loaded or eligible for login-time loading.
+  for service in "${SERVICES[@]}"; do
+    disable_reason=""
+    if ! service_should_be_active "${service}" "${APPLY}"; then
+      disable_reason="$(service_disable_reason "${service}" "${APPLY}")"
+      if ! stop_service "${service}"; then
+        if [[ -n "${reconciliation_errors}" ]]; then
+          reconciliation_errors+="; "
+        fi
+        reconciliation_errors+="${LAUNCHCTL_ERROR}"
+      fi
+      if [[ "${disable_reason}" == "missing-keychain" ]]; then
+        warn "Slack Keychain item is missing; notifier was not started"
+      fi
+    else
+      services_to_start[${#services_to_start[@]}]="${service}"
+    fi
+  done
+  if [[ -n "${reconciliation_errors}" ]]; then
+    die "failed to reconcile disabled launchd services: ${reconciliation_errors}"
+  fi
+
   if [[ "${APPLY}" -eq 1 ]] && ! cli_has_shadow_commands; then
     warn "shadow CLI commands are not installed; plists were installed but services were not started"
     warn "run ./scripts/mac-studio update --apply after installing the shadow runtime"
     return 0
   fi
 
-  for service in shadow web external-watchdog backup retention; do
-    if service_enabled "${service}"; then
-      case "${service}" in
-        shadow|web) bootstrap_service "${service}" 1 ;;
-        *) bootstrap_service "${service}" 0 ;;
-      esac
-    fi
+  for service in "${services_to_start[@]}"; do
+    start_one "${service}"
   done
-
-  if service_enabled notifier; then
-    if keychain_has_slack || [[ "${APPLY}" -eq 0 ]]; then
-      bootstrap_service notifier 1
-    else
-      warn "Slack Keychain item is missing; notifier was installed but not started"
-      warn "run ./scripts/mac-studio slack set --apply, then restart --apply"
-    fi
-  fi
 }
 
 install_all() {
   local allow_brew="${1:-0}"
   require_macos_for_apply
   [[ -f "${REPO_ROOT}/pyproject.toml" ]] || die "run this command from the cloned repository"
+  if [[ "${INSTANCE}" != "default" &&
+        ! -f "${CONFIG_PATH}" &&
+        "${SHADOW_MODE_OVERRIDE}" == "diagnostic" &&
+        "${START_SERVICES}" -eq 1 ]]; then
+    die "a new named diagnostic instance must be installed with --no-start and started only after review"
+  fi
+  if [[ "${START_SERVICES}" -eq 0 ]]; then
+    note "Disabling and unloading services because --no-start was selected"
+    stop_all_services
+  fi
   ensure_python "${allow_brew}"
   create_layout
   generate_config
+  validate_named_instance_config ||
+    die "named instance configuration failed isolation validation"
+  named_instance_port_is_unique ||
+    die "named instance dashboard port is not unique"
+  if service_enabled paper && ! validate_paper_config; then
+    die "refusing install/update of an enabled paper account with bundle or source drift"
+  fi
   install_runtime
   install_helpers
+  if [[ "${APPLY}" -eq 1 ]]; then
+    validate_bounded_shadow_profile ||
+      die "bounded shadow profile is missing, disabled, or unsafe"
+  fi
+  if service_enabled paper && ! validate_paper_config; then
+    die "installed paper runtime differs from its frozen manifest"
+  fi
   render_all_plists
   if [[ "${START_SERVICES}" -eq 1 ]]; then
     load_configured_services
-  else
-    note "Services were not loaded because --no-start was selected"
   fi
   if [[ "${APPLY}" -eq 1 ]]; then
     note "Installation completed. Data and configuration were preserved."
@@ -629,9 +1639,7 @@ uninstall_services() {
   local service
   require_macos_for_apply
   note "Unloading known Coinpilot LaunchAgents"
-  for service in "${SERVICES[@]}"; do
-    bootout_service "${service}"
-  done
+  stop_all_services
 
   note "Removing only installed helpers and LaunchAgent definitions"
   for service in "${SERVICES[@]}"; do
@@ -639,6 +1647,9 @@ uninstall_services() {
   done
   run_cmd rm -f \
     "${BIN_DIR}/coinpilot-service" \
+    "${BIN_DIR}/coinpilot-hourly-notifier" \
+    "${BIN_DIR}/coinpilot-bounded-shadow" \
+    "${BIN_DIR}/coinpilot-c2-config" \
     "${BIN_DIR}/coinpilot-backup" \
     "${BIN_DIR}/coinpilot-retention" \
     "${BIN_DIR}/coinpilot-keychain"
@@ -651,78 +1662,151 @@ uninstall_services() {
 
 validate_service_name() {
   case "$1" in
-    all|shadow|notifier|web|external-watchdog|backup|retention) return 0 ;;
+    all|shadow|paper|notifier|web|external-watchdog|backup|retention) return 0 ;;
     *) die "unknown service '$1'; expected all, ${SERVICES[*]}" ;;
   esac
 }
 
-for_each_service() {
-  local action="$1"
-  local requested="$2"
-  local service
-  validate_service_name "${requested}"
-  if [[ "${requested}" == "all" ]]; then
-    for service in "${SERVICES[@]}"; do
-      "${action}" "${service}"
-    done
-  else
-    "${action}" "${requested}"
-  fi
-}
-
 start_one() {
   local service="$1"
-  local kick=0
-  if ! service_enabled "${service}"; then
-    note "Skipping disabled service: ${service}"
+  local disable_reason=""
+  if ! service_should_be_active "${service}" "${APPLY}"; then
+    disable_reason="$(service_disable_reason "${service}" "${APPLY}")"
+    stop_one "${service}"
+    if [[ "${disable_reason}" == "missing-keychain" ]]; then
+      warn "Slack Keychain item is missing; ${service} was not started"
+    else
+      note "Skipping disabled service: ${service}"
+    fi
     return 0
   fi
   case "${service}" in
-    notifier)
-      if [[ "${APPLY}" -eq 1 ]] && ! keychain_has_slack; then
-        warn "Slack Keychain item is missing; ${service} was not started"
-        return 0
+    paper)
+      if [[ "${APPLY}" -eq 1 ]] && ! validate_paper_config; then
+        die "paper config failed isolation or schema validation"
       fi
       ;;
   esac
-  case "${service}" in
-    shadow|notifier|web|external-watchdog) kick=1 ;;
-  esac
-  bootstrap_service "${service}" "${kick}"
+  bootstrap_service "${service}"
 }
 
 stop_one() {
-  bootout_service "$1"
+  local service="$1"
+  if ! stop_service "${service}"; then
+    die "failed to stop ${service}: ${LAUNCHCTL_ERROR}"
+  fi
+}
+
+stop_all_services() {
+  local service
+  local errors=""
+  for service in "${SERVICES[@]}"; do
+    if ! stop_service "${service}"; then
+      if [[ -n "${errors}" ]]; then
+        errors+="; "
+      fi
+      errors+="${LAUNCHCTL_ERROR}"
+    fi
+  done
+  if [[ -n "${errors}" ]]; then
+    die "failed to stop launchd services: ${errors}"
+  fi
+}
+
+stop_service() {
+  local service="$1"
+  local errors=""
+  local operation_error=""
+  if ! set_service_launchd_enabled "${service}" 0; then
+    errors="${LAUNCHCTL_ERROR}"
+  fi
+  if ! bootout_service "${service}"; then
+    operation_error="${LAUNCHCTL_ERROR}"
+    if [[ -n "${errors}" ]]; then
+      errors+="; "
+    fi
+    errors+="${operation_error}"
+  fi
+  LAUNCHCTL_ERROR="${errors}"
+  [[ -z "${errors}" ]]
 }
 
 restart_one() {
-  stop_one "$1"
-  start_one "$1"
+  local service="$1"
+  if service_enabled "${service}"; then
+    # bootstrap_service already unloads an existing job before loading it.
+    # A separate stop here can race launchd's asynchronous bootout and remove
+    # the newly bootstrapped replacement after this command reports success.
+    start_one "${service}"
+  else
+    stop_one "${service}"
+    note "Skipping disabled service: ${service}"
+  fi
 }
 
 show_status() {
   local service
   local domain
+  local disable_reason
+  local override_state
   local web_host
   local web_port
+  local dashboard_state
+  local paper_summary
   domain="$(launch_domain 2>/dev/null || true)"
+  refresh_launchd_disabled_overrides "${domain}"
+  printf 'instance: %s\n' "${INSTANCE}"
   printf 'app_home: %s\n' "${APP_HOME}"
   printf 'launch_domain: %s\n' "${domain:-unavailable}"
   for service in "${SERVICES[@]}"; do
+    disable_reason="$(service_disable_reason "${service}" 1 2>/dev/null || true)"
+    override_state="$(service_launchd_override_state "${service}")"
     if service_is_loaded "${service}"; then
-      printf '%-20s loaded\n' "${service}"
+      if [[ -n "${disable_reason}" ]]; then
+        if [[ "${override_state}" == "disabled" ]]; then
+          printf '%-20s loaded-%s\n' "${service}" "${disable_reason}"
+        else
+          printf '%-20s loaded-%s-override-%s\n' \
+            "${service}" "${disable_reason}" "${override_state}"
+        fi
+      elif [[ "${override_state}" == "disabled" ]]; then
+        printf '%-20s loaded-override-disabled\n' "${service}"
+      elif [[ "${service}" == "paper" ]] && ! service_is_running paper; then
+        printf '%-20s loaded-not-running\n' "${service}"
+      else
+        printf '%-20s loaded\n' "${service}"
+      fi
     else
-      printf '%-20s not-loaded\n' "${service}"
+      if [[ -n "${disable_reason}" && "${override_state}" != "disabled" ]]; then
+        printf '%-20s not-loaded-%s-override-%s\n' \
+          "${service}" "${disable_reason}" "${override_state}"
+      elif [[ -z "${disable_reason}" && "${override_state}" == "disabled" ]]; then
+        printf '%-20s not-loaded-override-disabled\n' "${service}"
+      else
+        printf '%-20s not-loaded\n' "${service}"
+      fi
     fi
   done
   web_host="$(runtime_value COINPILOT_WEB_HOST 127.0.0.1)"
   web_port="$(runtime_value COINPILOT_WEB_PORT 8765)"
-  if command -v curl >/dev/null 2>&1 &&
-      curl --silent --show-error --fail --max-time 2 \
-        "http://${web_host}:${web_port}/health/ready" >/dev/null 2>&1; then
-    printf 'dashboard            ready (http://%s:%s)\n' "${web_host}" "${web_port}"
+  if ! service_enabled web; then
+    printf 'dashboard            disabled\n'
+  elif dashboard_state="$(probe_dashboard "${web_host}" "${web_port}" 2>/dev/null)"; then
+    printf 'dashboard            online (%s; http://%s:%s)\n' \
+      "${dashboard_state}" "${web_host}" "${web_port}"
   else
     printf 'dashboard            unavailable (http://%s:%s)\n' "${web_host}" "${web_port}"
+  fi
+  if service_enabled paper; then
+    paper_summary=""
+    if service_is_running paper && paper_summary="$(probe_paper_status)"; then
+      printf 'paper account        ready (%s)\n' "${FORWARD_PAPER_DB_PATH}"
+      printf 'paper state          %s\n' "${paper_summary}"
+    else
+      printf 'paper account        unavailable (%s)\n' "${FORWARD_PAPER_DB_PATH}"
+    fi
+  else
+    printf 'paper account        disabled\n'
   fi
 }
 
@@ -736,6 +1820,11 @@ doctor() {
   local free_kb
   local total_kb
   local free_pct
+  local probe_output
+  local probe_status
+  local domain
+  local disable_reason
+  local override_state
 
   doctor_ok() { printf 'OK    %s\n' "$*"; }
   doctor_warn() { printf 'WARN  %s\n' "$*"; warnings=$((warnings + 1)); }
@@ -752,15 +1841,50 @@ doctor() {
   else
     doctor_fail "missing ${VENV_DIR}/bin/coinpilot"
   fi
+  if [[ -x "${BIN_DIR}/coinpilot-hourly-notifier" ]]; then
+    doctor_ok "hourly Slack notifier helper exists"
+  else
+    doctor_fail "missing ${BIN_DIR}/coinpilot-hourly-notifier"
+  fi
   if cli_has_shadow_commands; then
     doctor_ok "all shadow CLI commands are present"
   else
     doctor_fail "one or more shadow CLI commands are missing"
   fi
+  if cli_has_paper_commands; then
+    doctor_ok "paper CLI commands are present"
+  else
+    doctor_fail "paper CLI commands are missing"
+  fi
   if [[ -f "${CONFIG_PATH}" ]]; then doctor_ok "config exists"; else doctor_fail "config missing"; fi
   if [[ -f "${RUNTIME_ENV}" ]]; then doctor_ok "runtime settings exist"; else doctor_fail "runtime settings missing"; fi
+  if [[ "${INSTANCE}" != "default" &&
+        -f "${CONFIG_PATH}" &&
+        -f "${RUNTIME_ENV}" ]]; then
+    if validate_named_instance_config; then
+      doctor_ok "named instance paths and capital boundaries are isolated"
+    else
+      doctor_fail "named instance configuration failed isolation validation"
+    fi
+    if named_instance_port_is_unique; then
+      doctor_ok "named instance dashboard port is unique"
+    else
+      doctor_fail "named instance dashboard port is duplicated"
+    fi
+  fi
+  if [[ -x "${VENV_DIR}/bin/python" &&
+        -f "${CONFIG_PATH}" &&
+        -f "${RUNTIME_ENV}" ]]; then
+    if validate_bounded_shadow_profile; then
+      if is_true "$(runtime_value COINPILOT_BOUNDED_SHADOW 0)"; then
+        doctor_ok "bounded 10% shadow profile and helper are valid"
+      fi
+    else
+      doctor_fail "bounded shadow profile is missing, disabled, or unsafe"
+    fi
+  fi
 
-  for mode in "${CONFIG_PATH}" "${RUNTIME_ENV}"; do
+  for mode in "${CONFIG_PATH}" "${RUNTIME_ENV}" "${PAPER_CONFIG_PATH}"; do
     if [[ -f "${mode}" ]]; then
       if grep -Eqi 'hooks\.slack|slack[^=]*=[[:space:]]*https://' "${mode}"; then
         doctor_fail "Slack secret-like URL found in ${mode}; move it to Keychain"
@@ -775,7 +1899,30 @@ doctor() {
     fi
   done
 
-  if keychain_has_slack; then
+  if service_enabled paper; then
+    if validate_paper_config; then
+      doctor_ok "paper config and database boundary are isolated"
+    else
+      doctor_fail "paper config failed isolation or schema validation"
+    fi
+    if service_is_running paper && probe_paper_status >/dev/null; then
+      doctor_ok "paper account status is readable"
+    else
+      doctor_fail "paper account status is unavailable or not initialized"
+    fi
+  elif [[ -f "${PAPER_CONFIG_PATH}" ]]; then
+    if validate_paper_config; then
+      doctor_ok "disabled paper config is valid"
+    else
+      doctor_fail "disabled paper config failed isolation or schema validation"
+    fi
+  else
+    doctor_ok "paper service is disabled"
+  fi
+
+  if ! service_enabled notifier; then
+    doctor_ok "Slack notifier is disabled"
+  elif keychain_has_slack; then
     doctor_ok "Slack webhook exists in Keychain (value not read)"
   else
     doctor_warn "Slack webhook Keychain item is missing"
@@ -789,9 +1936,31 @@ doctor() {
     doctor_fail "dashboard host must be 127.0.0.1, found ${host}"
   fi
 
+  domain="$(launch_domain 2>/dev/null || true)"
+  refresh_launchd_disabled_overrides "${domain}"
   for service in "${SERVICES[@]}"; do
+    disable_reason="$(service_disable_reason "${service}" 1 2>/dev/null || true)"
+    override_state="$(service_launchd_override_state "${service}")"
+    if [[ -n "${disable_reason}" ]]; then
+      if service_is_loaded "${service}"; then
+        doctor_fail "launchd loaded despite ${disable_reason}: ${service}"
+      fi
+      if [[ "${override_state}" == "disabled" ]]; then
+        doctor_ok "launchd explicitly disabled: ${service} (reason=${disable_reason})"
+      else
+        doctor_fail "launchd disable override drift: ${service} (reason=${disable_reason}, override=${override_state})"
+      fi
+      continue
+    fi
+    if [[ "${override_state}" == "disabled" ]]; then
+      doctor_fail "launchd disabled despite active configuration: ${service}"
+    fi
     if service_is_loaded "${service}"; then
-      doctor_ok "launchd loaded: ${service}"
+      if [[ "${service}" == "paper" ]] && ! service_is_running paper; then
+        doctor_fail "launchd loaded but not running: paper"
+      else
+        doctor_ok "launchd loaded: ${service}"
+      fi
     elif service_enabled "${service}"; then
       if [[ "${service}" == "notifier" ]]; then
         doctor_warn "launchd not loaded: ${service}"
@@ -801,12 +1970,21 @@ doctor() {
     fi
   done
 
-  if command -v curl >/dev/null 2>&1 &&
-      curl --silent --show-error --fail --max-time 2 \
-        "http://${host}:${port}/health/ready" >/dev/null 2>&1; then
-    doctor_ok "dashboard readiness endpoint responds"
+  probe_output=""
+  if ! service_enabled web; then
+    doctor_ok "dashboard service is disabled"
+  elif probe_output="$(probe_dashboard "${host}" "${port}" 2>&1)"; then
+    doctor_ok "dashboard status endpoint responds (${probe_output})"
+    if [[ "${probe_output}" != "ready" ]]; then
+      doctor_warn "shadow is not ready (${probe_output})"
+    fi
   else
-    doctor_warn "dashboard readiness endpoint is unavailable"
+    probe_status=$?
+    if [[ "${probe_status}" -eq 2 ]]; then
+      doctor_fail "${probe_output}"
+    else
+      doctor_warn "dashboard status endpoint is unavailable"
+    fi
   fi
 
   if [[ -d "${APP_HOME}" ]]; then
@@ -871,11 +2049,11 @@ slack_action() {
         "${helper}" "${action}" --account "${KEYCHAIN_ACCOUNT}" \
           --service "${KEYCHAIN_SERVICE}"
         if [[ "${action}" == "set" && -f "$(plist_path notifier)" ]]; then
-          note "Reloading Slack notifier"
-          bootstrap_service notifier 1
+          note "Reconciling Slack notifier"
+          start_one notifier
         elif [[ "${action}" == "delete" ]]; then
           note "Stopping Slack notifier so the removed secret is not retained"
-          bootout_service notifier
+          stop_one notifier
         fi
       fi
       ;;
@@ -893,6 +2071,48 @@ run_helper_mutation() {
     "${helper}" "$@" --apply --home "${APP_HOME}"
   else
     "${helper}" "$@" --home "${APP_HOME}"
+  fi
+}
+
+transition_observe() {
+  local helper="${REPO_ROOT}/scripts/manage_d2_observe_transition.py"
+  local service
+  local loaded=""
+  local -a arguments
+
+  [[ "${INSTANCE}" != "default" ]] ||
+    die "transition-observe requires an approved named D2 instance"
+  [[ -n "${TRANSITION_BACKUP}" ]] ||
+    die "transition-observe requires --backup"
+  [[ -n "${TRANSITION_VERSION}" ]] ||
+    die "transition-observe requires --version"
+  [[ -x "${helper}" ]] || die "missing executable helper: ${helper}"
+  select_python || die "Python >= 3.11 is required for transition-observe"
+
+  if [[ "${APPLY}" -eq 1 ]]; then
+    require_macos_for_apply
+    for service in "${SERVICES[@]}"; do
+      if service_is_loaded "${service}"; then
+        if [[ -n "${loaded}" ]]; then loaded+=", "; fi
+        loaded+="${service}"
+      fi
+    done
+    [[ -z "${loaded}" ]] ||
+      die "stop every ${INSTANCE} LaunchAgent before transition-observe; loaded: ${loaded}"
+  fi
+
+  arguments=(
+    "${helper}"
+    --home "${APP_HOME}"
+    --instance "${INSTANCE}"
+    --backup "${TRANSITION_BACKUP}"
+    --version "${TRANSITION_VERSION}"
+  )
+  if [[ "${APPLY}" -eq 1 ]]; then
+    PYTHONDONTWRITEBYTECODE=1 "${PYTHON_BIN}" "${arguments[@]}" --apply
+  else
+    PYTHONDONTWRITEBYTECODE=1 "${PYTHON_BIN}" "${arguments[@]}"
+    note "Dry-run only. Stop all instance services and rerun with --apply after review."
   fi
 }
 
@@ -922,17 +2142,37 @@ case "${COMMAND}" in
     ;;
   start)
     require_macos_for_apply
-    for_each_service start_one "${POSITIONAL[0]:-all}"
+    guard_named_instance_start
+    requested_service="${POSITIONAL[0]:-all}"
+    validate_service_name "${requested_service}"
+    if [[ "${requested_service}" == "all" ]]; then
+      load_configured_services
+    else
+      start_one "${requested_service}"
+    fi
     if [[ "${APPLY}" -eq 0 ]]; then note "Dry-run only. Rerun with --apply."; fi
     ;;
   stop)
     require_macos_for_apply
-    for_each_service stop_one "${POSITIONAL[0]:-all}"
+    requested_service="${POSITIONAL[0]:-all}"
+    validate_service_name "${requested_service}"
+    if [[ "${requested_service}" == "all" ]]; then
+      stop_all_services
+    else
+      stop_one "${requested_service}"
+    fi
     if [[ "${APPLY}" -eq 0 ]]; then note "Dry-run only. Rerun with --apply."; fi
     ;;
   restart)
     require_macos_for_apply
-    for_each_service restart_one "${POSITIONAL[0]:-all}"
+    guard_named_instance_start
+    requested_service="${POSITIONAL[0]:-all}"
+    validate_service_name "${requested_service}"
+    if [[ "${requested_service}" == "all" ]]; then
+      load_configured_services
+    else
+      restart_one "${requested_service}"
+    fi
     if [[ "${APPLY}" -eq 0 ]]; then note "Dry-run only. Rerun with --apply."; fi
     ;;
   logs)
@@ -946,6 +2186,9 @@ case "${COMMAND}" in
     ;;
   retention)
     run_helper_mutation "${REPO_ROOT}/scripts/mac-studio-retention"
+    ;;
+  transition-observe)
+    transition_observe
     ;;
   test)
     "${REPO_ROOT}/scripts/test-mac-studio-ops.sh"

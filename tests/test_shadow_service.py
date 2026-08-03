@@ -55,7 +55,11 @@ def _book(ordinal: int, *, imbalance: float) -> dict:
     }
 
 
-def _trade_with_gap(ordinal: int) -> dict:
+def _trade_with_gap(
+    ordinal: int,
+    *,
+    gap_reason: str = "websocket_reconnect",
+) -> dict:
     wall_ns = 1_800_000_000_000_000_000 + ordinal * 100_000_000
     return {
         "schema_version": 1,
@@ -67,7 +71,7 @@ def _trade_with_gap(ordinal: int) -> dict:
         "receive_delta_monotonic_ns": "100000000",
         "monotonic_regression": False,
         "gap_before": True,
-        "gap_reason": "receive_interval",
+        "gap_reason": gap_reason,
         "gap_duration_monotonic_ns": "100000000",
         "event": {
             "schema_version": 1,
@@ -162,6 +166,71 @@ def test_service_archives_and_completes_a_zero_order_shadow_round_trip(
     assert result.run_summary_path.exists()
 
 
+def test_service_daily_loss_halt_survives_gap_without_consumer_error(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    base = _config(tmp_path)
+    config = dataclasses.replace(
+        base,
+        shadow=dataclasses.replace(
+            base.shadow,
+            max_daily_loss_pct=0.000000001,
+        ),
+    ).validate()
+
+    def fake_record(**kwargs):
+        records = (
+            _book(1, imbalance=1),
+            _book(2, imbalance=1),
+            _book(3, imbalance=1),
+            _book(4, imbalance=-1),
+            _book(5, imbalance=-1),
+            _trade_with_gap(6),
+            _book(7, imbalance=1),
+            _book(8, imbalance=1),
+        )
+        for record in records:
+            kwargs["on_record"](record)
+        root = Path(kwargs["output_root"])
+        data = root / "fake.jsonl.gz"
+        manifest = root / "fake.manifest.json"
+        data.write_bytes(b"public-feed-halt-gap-audit")
+        manifest.write_text('{"schema_version":1}', encoding="utf-8")
+        return HFTArchiveResult(
+            capture_id=kwargs["capture_id"],
+            market=kwargs["market"],
+            requested_duration_seconds=kwargs["duration_seconds"],
+            elapsed_monotonic_seconds=0.8,
+            raw_messages=len(records),
+            written_events=len(records),
+            rejected_messages=0,
+            connection_count=1,
+            reconnect_count=0,
+            gap_count=1,
+            pings_sent=0,
+            heartbeats_received=0,
+            error_counts={"consumer_errors": 0},
+            data_paths=(data,),
+            manifest_paths=(manifest,),
+        )
+
+    monkeypatch.setattr(
+        shadow_service,
+        "record_upbit_public_archive",
+        fake_record,
+    )
+    result = shadow_service.run_shadow_service(
+        config,
+        capture_id="service-smoke",
+    )
+
+    assert result.archive.error_counts["consumer_errors"] == 0
+    assert result.status["lifecycle_status"] == "stopped"
+    assert result.status["halt_reason"] == "external_halt:daily_loss"
+    assert result.status["orders_sent"] == 0
+
+
 def test_gap_marker_on_intervening_trade_expires_pending_order(
     tmp_path: Path,
     monkeypatch,
@@ -212,3 +281,57 @@ def test_gap_marker_on_intervening_trade_expires_pending_order(
     assert result.status["fills"] == 0
     assert result.status["pending_orders"] == 0
     assert result.status["base_quantity"] == 0
+
+
+def test_receive_interval_on_intervening_trade_does_not_fake_a_disconnect(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = _config(tmp_path)
+
+    def fake_record(**kwargs):
+        records = (
+            _book(1, imbalance=1),
+            _book(2, imbalance=1),
+            _trade_with_gap(3, gap_reason="receive_interval"),
+            _book(4, imbalance=1),
+        )
+        for record in records:
+            kwargs["on_record"](record)
+        root = Path(kwargs["output_root"])
+        data = root / "fake.jsonl.gz"
+        manifest = root / "fake.manifest.json"
+        data.write_bytes(b"public-feed-observation-silence-audit")
+        manifest.write_text('{"schema_version":1}', encoding="utf-8")
+        return HFTArchiveResult(
+            capture_id=kwargs["capture_id"],
+            market=kwargs["market"],
+            requested_duration_seconds=kwargs["duration_seconds"],
+            elapsed_monotonic_seconds=0.4,
+            raw_messages=len(records),
+            written_events=len(records),
+            rejected_messages=0,
+            connection_count=1,
+            reconnect_count=0,
+            gap_count=1,
+            pings_sent=0,
+            heartbeats_received=0,
+            error_counts={},
+            data_paths=(data,),
+            manifest_paths=(manifest,),
+        )
+
+    monkeypatch.setattr(
+        shadow_service,
+        "record_upbit_public_archive",
+        fake_record,
+    )
+    result = shadow_service.run_shadow_service(
+        config,
+        capture_id="service-smoke",
+    )
+
+    assert result.status["fills"] == 1
+    assert result.status["pending_orders"] == 0
+    assert result.status["base_quantity"] > 0
+    assert result.status["orders_sent"] == 0

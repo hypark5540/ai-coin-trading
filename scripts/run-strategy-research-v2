@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+APP_PYTHON=${COINPILOT_PYTHON:-"${HOME}/Library/Application Support/Coinpilot/venv/bin/python"}
+PYTHONPATH="${SCRIPT_DIR}/../src${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH
+
+is_usable_python() {
+  candidate=$1
+  [ -x "$candidate" ] || return 1
+  "$candidate" -c 'import sys, numpy, pandas, coinpilot.portfolio_research; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)' \
+    >/dev/null 2>&1
+}
+
+if is_usable_python "$APP_PYTHON"; then
+  exec "$APP_PYTHON" "$SCRIPT_DIR/run_strategy_research_v2.py" "$@"
+fi
+
+for name in python3.13 python3.12 python3.11 python3; do
+  candidate=$(command -v "$name" 2>/dev/null || true)
+  if [ -n "$candidate" ] && is_usable_python "$candidate"; then
+    exec "$candidate" "$SCRIPT_DIR/run_strategy_research_v2.py" "$@"
+  fi
+done
+
+echo "error: Python >= 3.11 with numpy and pandas was not found" >&2
+exit 1

@@ -19,7 +19,7 @@ from coinpilot.broker import (
     SimulatedBroker,
     Trade,
 )
-from coinpilot.config import AppConfig
+from coinpilot.config import PROBABILITY_SIGNAL_MODES, AppConfig
 from coinpilot.data import MarketTicker, UpbitCandleClient, closed_candles
 from coinpilot.features import FEATURE_COLUMNS
 from coinpilot.risk import RiskManager
@@ -53,6 +53,10 @@ class PaperRunSummary:
 
     def as_dict(self) -> dict[str, Any]:
         return {
+            "mode": "forward_paper",
+            "simulated": True,
+            "live_order_routing": False,
+            "orders_sent": 0,
             "account_key": self.account_key,
             "initialized": self.initialized,
             "processed_bars": self.processed_bars,
@@ -113,6 +117,10 @@ def paper_config_fingerprint(config: AppConfig) -> str:
     values = config.as_dict()
     paper_policy = dict(values["paper"])
     paper_policy.pop("account_name", None)
+    model_policy = dict(values["model"])
+    if config.model.signal_mode != "trend_breakout":
+        model_policy.pop("breakout_entry_window")
+        model_policy.pop("breakout_exit_window")
     material = {
         "schema_version": PAPER_SCHEMA_VERSION,
         "strategy_version": PAPER_STRATEGY_VERSION,
@@ -121,7 +129,7 @@ def paper_config_fingerprint(config: AppConfig) -> str:
         "market": config.data.market,
         "interval_minutes": config.data.interval_minutes,
         "api_base_url": config.data.api_base_url,
-        "model": values["model"],
+        "model": model_policy,
         "risk": values["risk"],
         "paper_policy": paper_policy,
     }
@@ -387,7 +395,8 @@ class PaperSnapshotEngine:
             position_exited_this_snapshot = True
         elif (
             self.state.quantity > 0
-            and self.config.model.signal_mode == "expected_return"
+            and self.config.model.signal_mode
+            in {"expected_return", "trend_breakout"}
             and self.state.entry_horizon_exit_time is not None
             and ticker.observed_at
             >= pd.Timestamp(self.state.entry_horizon_exit_time)
@@ -467,7 +476,7 @@ class PaperSnapshotEngine:
 
         if (
             should_trade_signal
-            and self.config.model.signal_mode == "probability"
+            and self.config.model.signal_mode in PROBABILITY_SIGNAL_MODES
             and self.state.quantity > 0
             and self.state.halt_state == HALT_ACTIVE
             and not position_exited_this_snapshot
@@ -485,7 +494,7 @@ class PaperSnapshotEngine:
             position_exited_this_snapshot = True
 
         probability_entry = (
-            self.config.model.signal_mode == "probability"
+            self.config.model.signal_mode in PROBABILITY_SIGNAL_MODES
             and usable_probability is not None
             and usable_probability >= self.config.model.entry_probability
         )
@@ -522,7 +531,10 @@ class PaperSnapshotEngine:
                     model_id=model_id,
                 )
                 events.append(_fill_event(fill))
-                if self.config.model.signal_mode == "expected_return":
+                if self.config.model.signal_mode in {
+                    "expected_return",
+                    "trend_breakout",
+                }:
                     self.state.entry_horizon_exit_time = (
                         signal_time
                         + pd.Timedelta(
@@ -582,7 +594,7 @@ class PaperSnapshotEngine:
         if initialized or new_bar:
             self.state.pending_probability = (
                 usable_probability
-                if self.config.model.signal_mode == "probability"
+                if self.config.model.signal_mode in PROBABILITY_SIGNAL_MODES
                 and self.state.halt_state == HALT_ACTIVE
                 else None
             )
@@ -621,7 +633,7 @@ class PaperSnapshotEngine:
             )
             signal_value_present = (
                 usable_probability is not None
-                if self.config.model.signal_mode == "probability"
+                if self.config.model.signal_mode in PROBABILITY_SIGNAL_MODES
                 else usable_expected_net_edge is not None
             )
             self.state.pending_signal_time = (

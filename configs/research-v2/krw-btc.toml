@@ -1,0 +1,8 @@
+[data]
+market = "KRW-BTC"
+interval_minutes = 60
+candle_count = 52600
+database_path = "../../var/research-v2-candles.db"
+
+[output]
+artifacts_dir = "../../artifacts/strategy-v2/krw-btc"

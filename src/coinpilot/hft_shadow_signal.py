@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from coinpilot.hft_continuity import is_confirmed_continuity_gap
 from coinpilot.hft_depth import PublicOrderBook
 
 
@@ -124,7 +125,10 @@ class OnlineDiagnosticSignal:
         )
         if (
             boundary
-            or record.get("gap_before") is True
+            or is_confirmed_continuity_gap(
+                gap_before=record.get("gap_before") is True,
+                gap_reason=record.get("gap_reason"),
+            )
             or record.get("monotonic_regression") is True
         ):
             self.reset()

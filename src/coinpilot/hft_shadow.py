@@ -18,12 +18,14 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
+from coinpilot.hft_continuity import is_confirmed_continuity_gap
 from coinpilot.hft_depth import (
     IndependentTakerOrder,
     PublicOrderBook,
     sweep_visible_depth,
 )
 from coinpilot.hft_shadow_store import (
+    LATCHED_RECOVERY_REASONS,
     ShadowInvariantError,
     ShadowRunStart,
     ShadowStore,
@@ -364,7 +366,25 @@ class ShadowEngine:
                     completed_wall_ns=event_wall_ns,
                 )
                 state["warmup_books_seen"] = 0
-                if float(state["base_quantity"]) > self.config.position_epsilon:
+                prior_halt_reason = state.get("halt_reason")
+                latched_halt = bool(
+                    state["lifecycle_status"] == "halted_recovery"
+                    and isinstance(prior_halt_reason, str)
+                    and (
+                        prior_halt_reason.startswith("external_halt:")
+                        or prior_halt_reason in LATCHED_RECOVERY_REASONS
+                    )
+                )
+                if latched_halt:
+                    # A market-data discontinuity must never clear an
+                    # operator/risk/fingerprint latch.  Only automatic
+                    # open-position recovery halts may return to warmup after
+                    # their liquidation has completed.
+                    state["lifecycle_status"] = "halted_recovery"
+                elif (
+                    float(state["base_quantity"])
+                    > self.config.position_epsilon
+                ):
                     state["lifecycle_status"] = "halted_recovery"
                     state["halt_reason"] = (
                         f"continuity_with_open_position:{continuity_reason}"
@@ -722,11 +742,22 @@ class ShadowEngine:
         halt_reason = f"external_halt:{reason}"
         with self.store.write_transaction() as connection:
             state = connection.execute(
-                "SELECT lifecycle_status FROM shadow_state WHERE run_id = ?",
+                """
+                SELECT lifecycle_status, halt_reason
+                FROM shadow_state WHERE run_id = ?
+                """,
                 (self.run_id,),
             ).fetchone()
             if state is None:
                 raise ShadowInvariantError("shadow run state disappeared")
+            if (
+                state["lifecycle_status"] == "halted_recovery"
+                and state["halt_reason"] == halt_reason
+            ):
+                # The halt alert key is deterministic.  Treat a repeated
+                # request for the same already-latched reason as a true no-op
+                # so a later wall clock cannot collide with the first notice.
+                return 0
             expired = self._expire_pending(
                 connection,
                 reason=halt_reason,
@@ -1330,7 +1361,10 @@ class ShadowEngine:
     ) -> str | None:
         if book.monotonic_regression:
             return "monotonic_regression_marker"
-        if book.gap_before:
+        if is_confirmed_continuity_gap(
+            gap_before=book.gap_before,
+            gap_reason=book.gap_reason,
+        ):
             return f"gap:{book.gap_reason}"
         if state["last_capture_id"] is None:
             return None

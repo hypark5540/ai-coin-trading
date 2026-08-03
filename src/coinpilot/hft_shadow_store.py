@@ -27,6 +27,29 @@ RECOVERABLE_RUN_STATUSES = (*ACTIVE_RUN_STATUSES, "stopped")
 LATCHED_RECOVERY_REASONS = ("restart_fingerprint_changed",)
 
 
+_LATEST_HEALTH_SQL = """
+    WITH latest_time AS (
+        SELECT component, MAX(observed_wall_ns) AS observed_wall_ns
+        FROM shadow_health
+        WHERE run_id = ?
+        GROUP BY component
+    ),
+    latest_row AS (
+        SELECT MAX(h.rowid) AS rowid
+        FROM latest_time AS latest
+        CROSS JOIN shadow_health AS h
+        WHERE h.run_id = ?
+          AND h.component = latest.component
+          AND h.observed_wall_ns = latest.observed_wall_ns
+        GROUP BY latest.component
+    )
+    SELECT h.component, h.status, h.observed_wall_ns, h.details_json
+    FROM latest_row
+    JOIN shadow_health AS h ON h.rowid = latest_row.rowid
+    ORDER BY h.component
+"""
+
+
 class ShadowStoreError(RuntimeError):
     """Base class for durable shadow-ledger failures."""
 
@@ -381,6 +404,8 @@ class ShadowStore:
                     ON notification_outbox(
                         status, available_wall_ns, created_wall_ns
                     );
+                CREATE INDEX IF NOT EXISTS idx_notification_outbox_run_status
+                    ON notification_outbox(run_id, status);
 
                 CREATE TABLE IF NOT EXISTS shadow_health (
                     health_id TEXT PRIMARY KEY,
@@ -830,6 +855,34 @@ class ShadowStore:
         run_id = self.latest_run_id(market)
         return None if run_id is None else self.read_status(run_id)
 
+    def read_latest_feed_anchor(self, market: str) -> dict[str, Any] | None:
+        """Read only the latest run and wall-clock fields used by watchdogs."""
+
+        selected_market = _required_text(market, "market").upper()
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT r.run_id, r.started_wall_ns, s.last_book_wall_ns
+                FROM shadow_runs AS r
+                JOIN shadow_state AS s ON s.run_id = r.run_id
+                WHERE r.market = ?
+                ORDER BY r.started_wall_ns DESC, r.rowid DESC
+                LIMIT 1
+                """,
+                (selected_market,),
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    @staticmethod
+    def _latest_health_rows(
+        connection: sqlite3.Connection,
+        run_id: str,
+    ) -> list[sqlite3.Row]:
+        return connection.execute(
+            _LATEST_HEALTH_SQL,
+            (run_id, run_id),
+        ).fetchall()
+
     def read_status(self, run_id: str) -> dict[str, Any]:
         """Return a bounded status snapshot for a localhost read API."""
 
@@ -860,20 +913,7 @@ class ShadowStore:
                 """,
                 (run_id, run_id, run_id, run_id),
             ).fetchone()
-            health_rows = connection.execute(
-                """
-                SELECT component, status, observed_wall_ns, details_json
-                FROM shadow_health AS h
-                WHERE run_id = ?
-                  AND observed_wall_ns = (
-                    SELECT MAX(observed_wall_ns)
-                    FROM shadow_health
-                    WHERE run_id = h.run_id AND component = h.component
-                  )
-                ORDER BY component
-                """,
-                (run_id,),
-            ).fetchall()
+            health_rows = self._latest_health_rows(connection, run_id)
             pending_order = connection.execute(
                 """
                 SELECT order_id, side, request_kind, requested_base,
@@ -990,20 +1030,7 @@ class ShadowStore:
         """Return the latest persisted heartbeat for every component."""
 
         with self._connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT component, status, observed_wall_ns, details_json
-                FROM shadow_health AS h
-                WHERE run_id = ?
-                  AND observed_wall_ns = (
-                    SELECT MAX(observed_wall_ns)
-                    FROM shadow_health
-                    WHERE run_id = h.run_id AND component = h.component
-                  )
-                ORDER BY component
-                """,
-                (run_id,),
-            ).fetchall()
+            rows = self._latest_health_rows(connection, run_id)
         return [
             {
                 "component": row["component"],

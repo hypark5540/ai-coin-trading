@@ -12,6 +12,11 @@
     <string>@@APP_HOME@@</string>
   </array>
   <key>WorkingDirectory</key><string>@@APP_HOME@@</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>COINPILOT_LOG_DIR</key><string>@@LOG_DIR@@</string>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+  </dict>
   <key>StartCalendarInterval</key>
   <dict><key>Hour</key><integer>4</integer><key>Minute</key><integer>15</integer></dict>
   <key>ProcessType</key><string>Background</string>

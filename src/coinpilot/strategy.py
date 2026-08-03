@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 
 from coinpilot.config import ModelConfig
-from coinpilot.data import candle_data_hash
+from coinpilot.data import candle_data_hash, validate_candles
 from coinpilot.features import (
     FEATURE_COLUMNS,
     EXPECTED_RETURN_FEATURE_COLUMNS,
@@ -74,13 +74,29 @@ class PredictionResult:
 
 
 def model_config_hash(model_config: ModelConfig) -> str:
+    values = asdict(model_config)
+    if model_config.signal_mode != "trend_breakout":
+        # These settings have no effect on the pre-existing learned modes.
+        # Omitting them preserves their persisted provenance hashes.
+        values.pop("breakout_entry_window")
+        values.pop("breakout_exit_window")
     material = json.dumps(
-        asdict(model_config),
+        values,
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
     )
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def trend_breakout_model_id(model_config: ModelConfig) -> str:
+    """Return the stable, data-independent identifier for the causal rule."""
+
+    return (
+        "trend-breakout-v1-"
+        f"entry{model_config.breakout_entry_window}-"
+        f"exit{model_config.breakout_exit_window}"
+    )
 
 
 def fit_manifest_hash(fits: tuple[FitRecord, ...]) -> str:
@@ -650,6 +666,74 @@ def _expected_return_walk_forward(
     )
 
 
+def trend_breakout_scores(
+    candles: pd.DataFrame,
+    *,
+    interval_minutes: int,
+    model_config: ModelConfig,
+) -> tuple[pd.Series, pd.Series]:
+    """Build a causal, gap-reset trend score from completed candles.
+
+    A score is emitted only after a complete entry lookback exists within the
+    current contiguous segment. The rolling high and low are shifted by one,
+    so the current candle can never establish the threshold it is tested
+    against. The current close is allowed in the current SMA by definition.
+    """
+
+    if interval_minutes != 60:
+        raise ValueError("trend_breakout requires 60-minute candles")
+    frame = validate_candles(candles)
+    expected = pd.Timedelta(minutes=interval_minutes)
+    gaps = frame["timestamp"].diff().ne(expected)
+    gaps.iloc[0] = True
+    segment_ids = gaps.cumsum()
+    scores = pd.Series(np.nan, index=frame.index, dtype=float)
+    model_ids = pd.Series(None, index=frame.index, dtype=object)
+    stable_model_id = trend_breakout_model_id(model_config)
+
+    for _, indexes in frame.groupby(segment_ids).groups.items():
+        segment = frame.loc[indexes]
+        previous_high = (
+            segment["high"]
+            .shift(1)
+            .rolling(
+                model_config.breakout_entry_window,
+                min_periods=model_config.breakout_entry_window,
+            )
+            .max()
+        )
+        previous_low = (
+            segment["low"]
+            .shift(1)
+            .rolling(
+                model_config.breakout_exit_window,
+                min_periods=model_config.breakout_exit_window,
+            )
+            .min()
+        )
+        current_sma = segment["close"].rolling(
+            model_config.breakout_entry_window,
+            min_periods=model_config.breakout_entry_window,
+        ).mean()
+        ready = previous_high.notna() & previous_low.notna() & current_sma.notna()
+        entries = (
+            ready
+            & segment["close"].gt(previous_high)
+            & segment["close"].gt(current_sma)
+        )
+        exits = ready & segment["close"].lt(previous_low)
+        segment_scores = pd.Series(np.nan, index=segment.index, dtype=float)
+        segment_scores.loc[ready] = 0.5
+        segment_scores.loc[exits] = 0.0
+        segment_scores.loc[entries] = 1.0
+        scores.loc[indexes] = segment_scores
+        model_ids.loc[ready[ready].index] = stable_model_id
+
+    scores.name = "probability"
+    model_ids.name = "model_id"
+    return scores, model_ids
+
+
 def generate_walk_forward_predictions(
     candles: pd.DataFrame,
     *,
@@ -683,6 +767,37 @@ def generate_walk_forward_predictions(
             model_config=model_config,
             round_trip_cost=round_trip_cost,
             positive_threshold=positive_threshold,
+        )
+    elif model_config.signal_mode == "trend_breakout":
+        probabilities, model_ids = trend_breakout_scores(
+            candles,
+            interval_minutes=interval_minutes,
+            model_config=model_config,
+        )
+        fits_tuple = ()
+        raw_forecasts = pd.Series(
+            np.nan, index=feature_frame.index, dtype=float,
+            name="raw_expected_gross_return",
+        )
+        gross_forecasts = pd.Series(
+            np.nan, index=feature_frame.index, dtype=float,
+            name="expected_gross_return",
+        )
+        calibration_buffers = pd.Series(
+            np.nan, index=feature_frame.index, dtype=float,
+            name="calibration_buffer",
+        )
+        net_edges = pd.Series(
+            np.nan, index=feature_frame.index, dtype=float,
+            name="expected_net_edge",
+        )
+        signal_eligible = pd.Series(
+            False, index=feature_frame.index, dtype=bool,
+            name="signal_eligible",
+        )
+        no_trade_reasons = pd.Series(
+            None, index=feature_frame.index, dtype=object,
+            name="no_trade_reason",
         )
     else:
         probabilities, model_ids, fits_tuple = _probability_walk_forward(

@@ -24,18 +24,31 @@ Upbit 키는 사용하지 않는다.
 
 프로세스는 다음과 같이 분리된다.
 
-- `shadow`: 공개 WebSocket, 실시간 feature, 모의 주문·체결, shadow 원장
-- `notifier`: DB outbox에서 Slack 전송 및 재시도
+- `shadow`: 공개 WebSocket, 실시간 feature와 shadow 원장. `observe` profile은
+  주문·체결 없이 관측만 하고, 별도 승인된 diagnostic profile만 모의 체결을 만든다.
+- `paper`: 기본 비활성인 60분봉 C2 forward-paper 계좌
+- `notifier`: 직전 완료 KST 1시간을 집계해 Slack 요약 전송 및 재시도
 - `web`: localhost 전용 읽기 API와 dashboard
 - `external-watchdog`: 60초마다 실행되는 별도 watchdog 프로세스
 - `backup`: 매일 03:15 SQLite online backup과 integrity check
 - `retention`: 매일 04:15 원본·백업·회전 로그의 제한적 보존 처리
+- `daily-scorecard`: 승인된 D2/C2 8개 원장의 전일 KST 성적표를 매일 00:10
+  Slack으로 보내는 별도 중앙 one-shot job
+
+`paper`는 기존 `shadow`와 설정 및 SQLite 원장을 공유하지 않는다. 설치는 되지만
+`COINPILOT_ENABLE_PAPER=0`이 기본값이므로 설정을 생성하고 검토하기 전에는
+LaunchAgent가 로드되지 않는다.
 
 `external-watchdog`는 주 엔진과 분리되어 프로세스 장애를 알릴 수 있지만 같은
 Mac에서 실행된다. Mac의 전원이나 인터넷이 완전히 끊기면 Slack을 보낼 수
 없다. 진정한 외부 dead-man 감시는 별도 서버나 SaaS가 이 Mac의 heartbeat
 부재를 확인하도록 추가해야 한다. 공급자를 정하기 전까지 이 부분은 의도적으로
 placeholder다.
+
+`daily-scorecard`는 per-instance 7개 서비스와 별도다. 거래 instance의 venv,
+config, package, fingerprint, DB 또는 outbox를 변경하지 않고 SQLite
+`mode=ro` + `query_only`로만 읽는다. 전송 원장과 JSON/Markdown 감사 산출물은
+`~/Library/Application Support/Coinpilot/reporting` 아래에 owner-only로 보존한다.
 
 ## 최초 설치
 
@@ -44,11 +57,9 @@ Mac Studio의 GitHub SSH 공개키를 `hypark5540` 계정에 등록한 뒤 clone
 ```bash
 git clone git@github.com:hypark5540/ai-coin-trading.git
 cd ai-coin-trading
-git config user.name hypark5540
 ```
 
-commit 작성까지 할 Mac이라면 GitHub 계정에 등록된 이메일도 이 저장소의
-`user.email`로 설정한다. 이메일은 저장소가 추측해 넣지 않는다.
+설치 도구는 이미 구성된 Git identity와 SSH 설정을 읽거나 변경하지 않는다.
 
 먼저 변경 내용을 확인한다.
 
@@ -82,7 +93,8 @@ prompt가 직접 받는다.
    의존성을 순서대로 설치한다.
 5. secret 없는 `config.toml`과 `runtime.env`를 최초 한 번 생성한다.
 6. retention 대상 디렉터리에 owner-only managed marker를 만든다.
-7. 현재 사용자 경로로 plist를 렌더링하고 `launchctl bootstrap`한다.
+7. 현재 사용자 경로로 7개 plist를 렌더링하고 활성화된 작업만
+   `launchctl bootstrap`한다.
 
 기존 설정, DB, 원본 데이터 및 백업은 다시 실행해도 덮어쓰거나 지우지 않는다.
 Slack secret이 없으면 notifier만 설치하고 시작하지 않는다. watchdog는 secret을
@@ -90,6 +102,180 @@ Slack secret이 없으면 notifier만 설치하고 시작하지 않는다. watch
 
 설정 파일과 plist까지 검토한 뒤 시작하고 싶다면 `bootstrap --apply --no-start`를
 사용하고, 검토 후 `start --apply`를 실행한다.
+
+`stop --apply`와 `--no-start` 설치는 현재 세션에서 job을 내리는 것뿐 아니라
+해당 LaunchAgent를 launchd에 명시적으로 비활성화한다. 따라서 plist의
+`RunAtLoad`가 남아 있어도 다음 로그인이나 재부팅 때 되살아나지 않는다.
+`start --apply`는 검증을 통과한 대상만 다시 명시적으로 활성화한다. Doctor는
+`runtime.env`에서 비활성인 job이 loaded 상태이거나 persistent override가
+disabled가 아니면 오류로 보고한다.
+
+## BTC + ETH 격리 인스턴스
+
+한 shadow 엔진은 의도적으로 한 시장만 처리한다. 여러 시장을 한 프로세스에
+섞는 대신 named instance가 단일시장 스택 전체를 복제한다. 다음 구성은 총
+모의자금 경계를 BTC와 ETH에 각각 5백만원씩 분리하고, 수익 전략을 켜지 않은
+`observe` 모드로 공개피드와 운영 상태만 수집한다. 주문금액 12만5천원은 이후
+명시적인 diagnostic 배관 검사를 할 때의 상한이며 observe에서는 사용되지 않는다.
+
+먼저 두 인스턴스를 서비스 시작 없이 생성한다.
+
+```bash
+./scripts/mac-studio bootstrap \
+  --instance btc \
+  --market KRW-BTC \
+  --initial-cash 5000000 \
+  --order-quote 125000 \
+  --shadow-mode observe \
+  --web-port 8766 \
+  --no-start --apply
+
+./scripts/mac-studio bootstrap \
+  --instance eth \
+  --market KRW-ETH \
+  --initial-cash 5000000 \
+  --order-quote 125000 \
+  --shadow-mode observe \
+  --web-port 8767 \
+  --no-start --apply
+```
+
+설정과 plist를 검토한 뒤 각각 시작하고 확인한다.
+
+```bash
+./scripts/mac-studio start all --instance btc --apply
+./scripts/mac-studio doctor --instance btc
+
+./scripts/mac-studio start all --instance eth --apply
+./scripts/mac-studio doctor --instance eth
+```
+
+Dashboard는 BTC `http://127.0.0.1:8766`, ETH
+`http://127.0.0.1:8767`이다. 각 인스턴스는 다음 항목을 공유하지 않는다.
+
+- config, shadow DB와 DB writer lock
+- raw archive와 full-sync audit WAL/recorder lock
+- backup 디렉터리와 backup lock
+- 로그와 retention 경계
+- venv의 non-editable 애플리케이션 복사본
+- LaunchAgent label과 plist
+- dashboard port
+
+Slack webhook 목적지만 기존 Keychain 항목을 함께 사용한다. notifier는 매시
+BTC와 ETH를 각각 한 개의 `KRW-BTC`/`KRW-ETH` Block Kit 요약으로 보내므로
+출처가 구분된다. 두 계좌의 cash, drawdown, daily-loss는 독립적으로 계산되며
+공유 현금 포트폴리오가 아니다.
+
+Strategy Research V2 검수 뒤의 운영 champion은 `cash/observe-only`다.
+`diagnostic`은 알파 전략으로 재가동하지 않으며, 과거 diagnostic 원장을 새
+observe 원장으로 전환할 때는 먼저 SQLite online backup과 integrity check를
+수행하고 기존 DB를 timestamped legacy 디렉터리에 보존한다. fingerprint가 다른
+DB를 같은 경로에서 그대로 이어 쓰면 의도적으로 recovery HALT가 걸린다.
+
+named instance의 일상 명령에는 항상 같은 `--instance`를 붙인다.
+
+```bash
+./scripts/mac-studio status --instance btc
+./scripts/mac-studio logs shadow --instance eth
+./scripts/mac-studio backup --instance btc --apply
+./scripts/mac-studio restart shadow --instance eth --apply
+```
+
+새 named `diagnostic` 인스턴스는 실수로 즉시 시작되지 않도록 최초 설치에
+`--no-start`가 필수다. 기존 config를 다시 설치할 때 전달한 시장·자금·주문금액·
+mode·port가 다르면 설치기는 보존된 설정을 덮어쓰지 않고 실패한다. named
+인스턴스의 DB, archive, backup, log 경로가 자기 app home을 벗어나거나 다른
+instance와 dashboard port가 겹쳐도 시작을 거부한다.
+
+### D2 public-feed observe
+
+현재 D2 네 인스턴스는 공개 WebSocket의 continuity·freshness·운영 배관만
+관찰하는 `observe-public-feed-v1`이다. 결정·주문·체결을 생성하지 않으며
+decisions/orders/fills/pending이 하나라도 생기면 profile 위반으로 fail-closed한다.
+과거 bounded diagnostic은 2026-08-03에 모두 flat/pending 0으로 종료했고 재가동하지
+않는다.
+
+| 인스턴스 | 시장 | Dashboard | 모의자금 | 주문금액 |
+| --- | --- | --- | ---: | ---: |
+| `d2-btc` | KRW-BTC | `127.0.0.1:8774` | ₩5,000,000 | ₩25,000 |
+| `d2-eth` | KRW-ETH | `127.0.0.1:8775` | ₩5,000,000 | ₩25,000 |
+| `d2-xrp` | KRW-XRP | `127.0.0.1:8776` | ₩5,000,000 | ₩25,000 |
+| `d2-sol` | KRW-SOL | `127.0.0.1:8777` | ₩5,000,000 | ₩25,000 |
+
+D2 활성 profile은 다음 값을 fail-closed로 강제한다.
+
+```text
+shadow.mode=observe
+shadow.model_version=observe-public-feed-v1
+shadow.max_daily_loss_pct=0.10
+shadow.max_drawdown_pct=0.10
+COINPILOT_BOUNDED_SHADOW=0
+COINPILOT_ENABLE_SHADOW=1
+COINPILOT_ENABLE_PAPER=0
+COINPILOT_ENABLE_NOTIFIER=0
+```
+
+2026-08-03 배포 버전의 활성 원장은 각 instance에 다음 이름으로 존재한다.
+
+```text
+data/shadow-observe-public-feed-v1-431ddb7ff5c2.db
+state/d2-observe-transition-431ddb7ff5c2.json
+```
+
+transition receipt가 보존한 bounded diagnostic terminal 합계는 실현손익
+`-₩31,740.288130`, 수수료 `₩22,220.239976`, decisions/orders 각 `1,818`, fills
+`1,778`, pending `0`이다. 시장별 실현손익은 BTC `-₩7,840.140535`, ETH
+`-₩7,958.320007`, XRP `-₩7,230.933218`, SOL `-₩8,710.894369`다. 이 결과는
+수익 alpha 부재와 비용 지배를 확인한 동결 증거이며 활성 observe PnL에 합산하지
+않는다. 중앙 성적표도 current active ledger only로 집계한다.
+
+향후 다른 diagnostic 원장을 observe로 전환해야 할 때만 다음 순서를 한 instance씩
+사용한다. 현재 전환 완료된 네 D2에 이 명령을 다시 실행하지 않는다.
+
+```bash
+./scripts/mac-studio status --instance d2-btc
+./scripts/mac-studio doctor --instance d2-btc
+./scripts/mac-studio backup --instance d2-btc --apply
+./scripts/mac-studio stop all --instance d2-btc --apply
+./scripts/mac-studio status --instance d2-btc
+./scripts/mac-studio backup --instance d2-btc --apply
+
+./scripts/mac-studio transition-observe --instance d2-btc \
+  --backup "/exact/terminal/backup/from/previous/command.sqlite" \
+  --version 0123456789ab
+./scripts/mac-studio transition-observe --instance d2-btc \
+  --backup "/exact/terminal/backup/from/previous/command.sqlite" \
+  --version 0123456789ab --apply
+
+./scripts/mac-studio install --instance d2-btc --no-start --apply
+./scripts/mac-studio start all --instance d2-btc --apply
+./scripts/mac-studio doctor --instance d2-btc
+./scripts/mac-studio status --instance d2-btc
+```
+
+`--version`은 CI를 통과해 실제 설치할 commit의 정확한 12자리 prefix여야 한다.
+전환기는 모든 instance LaunchAgent가 unloaded인지 wrapper에서 확인하고, writer
+lock·stopped·flat·pending 0·halt 없음·실주문 불변조건을 다시 검증한다. 정지 뒤에도
+WAL/SHM이 남을 수 있으므로 삭제하거나 checkpoint/truncate하지 않는다. 전환기는
+원본 main/WAL/SHM의 identity·크기·SHA-256을 고정하고 private copy의 main+WAL로
+standalone snapshot을 만든 뒤 검증된 terminal online backup과 schema·terminal
+state·전체 logical dump hash를 비교한다. SHM은 논리 source of truth로 쓰지 않고
+원본 해시 증거만 receipt에 남긴다. 설정 변경 뒤에도 기존 원장, sidecar, pre-stop/
+terminal backup은 모두 보존한다.
+
+점검 명령은 다음과 같다.
+
+```bash
+for instance in d2-btc d2-eth d2-xrp d2-sol; do
+  ./scripts/mac-studio doctor --instance "$instance"
+  ./scripts/mac-studio status --instance "$instance"
+done
+```
+
+`doctor`는 helper, owner-only 설정, 정확한 observe profile, 비활성 paper/notifier,
+localhost dashboard와 LaunchAgent 상태를 검사한다. API에서는 `strategy_mode=observe`,
+ready/fresh, flat, decisions/fills/pending 0과 `simulated=true`,
+`live_order_routing=false`, `orders_sent=0`을 함께 확인한다.
 
 ## 필수 macOS 설정
 
@@ -123,9 +309,12 @@ LaunchAgent와 로그인 Keychain을 쓰므로 전용 운영 사용자가 로그
 COINPILOT_WEB_HOST=127.0.0.1
 COINPILOT_WEB_PORT=8765
 COINPILOT_ENABLE_SHADOW=1
+COINPILOT_ENABLE_PAPER=0
 COINPILOT_ENABLE_NOTIFIER=1
 COINPILOT_ENABLE_WEB=1
 COINPILOT_ENABLE_WATCHDOG=1
+COINPILOT_SLACK_SUMMARY_SECONDS=3600
+COINPILOT_SLACK_SUMMARY_GRACE_SECONDS=15
 COINPILOT_RETENTION_DAYS=90
 COINPILOT_BACKUP_RETENTION_DAYS=35
 COINPILOT_LOG_RETENTION_DAYS=30
@@ -134,15 +323,179 @@ COINPILOT_LOG_MAX_MB=100
 
 실제 shadow DB·archive·backup 경로는 최초 생성 시 `config.toml`의
 `[shadow].database_path`, `[shadow].archive_root`,
-`[operations].backup_dir`에 절대 경로로 기록된다. 백업·retention helper도
-이 설정을 직접 읽으므로 paper DB와 혼동하거나 경로를 이중 관리하지 않는다.
+`[operations].backup_dir`에 절대 경로로 기록된다. 활성 C2 paper 원장은 별도
+`config/paper.toml`과 `data/coinpilot-c2.db`만 사용한다. backup helper는 shadow와
+활성 paper DB를 서로 다른 파일명으로 online backup하며 retention은 같은 검증된
+backup 및 `paper.stdout.log`/`paper.stderr.log` 경계를 처리한다.
 
-Slack URL은 두 파일 어디에도 넣지 않는다. notifier가 `config.toml`에 있는
+Slack URL은 어떤 설정 파일에도 넣지 않는다. notifier가 `config.toml`에 있는
 Keychain service/account 식별자로 Keychain을 직접 조회한다. service wrapper나
 launchd 환경변수로 webhook을 전달하지 않는다. dashboard host를
 `127.0.0.1` 이외로 변경하면 service wrapper와 애플리케이션이 시작을 거부해야
 한다. 원격 확인은 공개 포트를 여는 대신 SSH tunnel 또는 Tailscale Serve를
 사용한다.
+
+### C2 forward-paper 서비스
+
+C2는 `KRW-BTC`, `KRW-ETH`, `KRW-XRP`, `KRW-SOL`을 독립된 250만원 sleeve로
+운영하는 60분봉 336/168 돌파 전략이다. 각 인스턴스는 다음 고정 경계를 쓴다.
+
+```text
+config/paper.toml
+data/coinpilot-c2.db
+COINPILOT_ENABLE_PAPER=1
+```
+
+설치기는 C2의 전체 모델·위험·paper 실행 정책, 동일 instance 시장, 공개 Upbit API,
+고정 DB 경계와 `paper.manifest.json`의 설정·설치 package SHA-256을 시작 전에
+검증한다. 같은 검증은 LaunchAgent의 최초 실행, KeepAlive 재시작, 로그인 후 재실행
+때마다 repo 없이 설치된 package 바이트를 대상으로 반복된다. account 또는 DB 경로,
+설정 바이트나 설치된 소스가 manifest와 다르면 wrapper가 엔진 실행 전에 실패한다.
+활성 paper 계좌의 install/update도 기존 manifest와 소스가 동일하지 않으면
+거부하므로 변경된 코드는 새 계좌와 새 T0가 필요하다.
+
+상태 점검은 launchd job 등록만 보지 않고 실제 `running` state와 살아 있는 PID를
+확인한 뒤 원장을 읽기 전용으로 열어 schema v8, config fingerprint, ACTIVE 상태,
+revision과 최근 갱신시각을 확인한다. 어느 검증이든 실패하면 ready로 표시하지
+않는다. wrapper는 항상
+`COINPILOT_LIVE_TRADING=0`과 `COINPILOT_MODE=paper`를 강제하며 private API 키나
+실주문 adapter를 사용하지 않는다.
+
+사용자가 요청한 즉시 activation에서는 각 새 원장의 첫 성공 초기화 시각을 T0로
+기록한다. 미리 prime한 DB를 중지했다가 공식 원장으로 재사용하면 안 된다. 네 시장의
+최초 2,501개 캔들 동기화는 Upbit 호출 집중을 피하도록 인스턴스를 순차 시작한다.
+
+기존 `notifier`와 `web`은 shadow DB만 읽는다. 따라서 C2 체결은 현재 Slack 시간별
+shadow 요약과 dashboard에 섞이지 않으며 다음 명령으로 확인한다.
+
+```bash
+./scripts/mac-studio status --instance c2-btc
+./scripts/mac-studio doctor --instance c2-btc
+./scripts/mac-studio logs paper --instance c2-btc
+```
+
+paper 전용 named instance에서는 `COINPILOT_ENABLE_SHADOW`,
+`COINPILOT_ENABLE_NOTIFIER`, `COINPILOT_ENABLE_WEB`,
+`COINPILOT_ENABLE_WATCHDOG`를 모두 `0`으로 두고 paper·backup·retention만 실행할
+수 있다. 이때 Doctor는 비활성 Slack과 dashboard를 장애로 보고하지 않는다.
+
+### Slack 알림 정책
+
+운영 LaunchAgent는 개별 체결·시작·종료·재시작·continuity 이벤트를 Slack으로
+즉시 보내지 않는다. 원본 fill/run/health와 outbox 행은 SQLite에 남기고, notifier가
+KST 기준 직전 완료 고정 구간 `[HH:00, 다음 HH:00)`을 하나의 요약으로 압축한다.
+요약에는 다음 항목이 들어간다.
+
+- 구간 평가자산 변동과 수익률, 마감 평가자산·포지션
+- 완료 거래 손익, 승/패/보합, 평균 보유시간
+- 매수·매도 체결 수, 거래대금, 수수료
+- runtime error, 재시작, halt, continuity, warning/critical 횟수
+- `simulated=true`, `live_order_routing=false`, `orders_sent=0`
+
+거래가 없는 시간도 상태 heartbeat 한 건을 보낸다. 시장·시간 경계의
+deterministic key로 정상 재시작과 동시 실행 때 같은 요약이 중복 생성되는 것을
+막는다. 단, Slack webhook POST 성공 직후 `delivered` 기록 전에 프로세스가
+종료되는 드문 경우에는 같은 구간이 한 번 더 전송될 수 있는 at-least-once
+경계가 있다. 오랜 중단 뒤에는 가장 최근 완료 구간만 만들며 과거 시간별
+메시지를 몰아서 보내지 않는다. Slack 실패는 lease와 지수 backoff로 재시도한다.
+
+이 정책은 즉시 critical Slack도 시간 요약으로 지연한다. 실제 주문 경로가 없는
+shadow 전용 운용을 전제로 한 저소음 설정이다. 외부 dead-man 감시가 필요하면
+별도 서버/SaaS에서 구성해야 한다.
+
+위 시간별 notifier는 D2 shadow DB의 outbox를 변경하고 C2를 읽지 못하므로 통합
+일일 보고에 사용하지 않는다. D2/C2의 `COINPILOT_ENABLE_NOTIFIER=0`과 persistent
+disabled override를 그대로 유지한다.
+
+### D2 + C2 통합 일일 성적표
+
+중앙 리포터는 다음 8개만 명시 allowlist한다.
+
+```text
+D2: d2-btc, d2-eth, d2-xrp, d2-sol
+C2: c2-btc, c2-eth, c2-xrp, c2-sol
+```
+
+DB를 glob하지 않으므로 legacy `btc/eth/xrp/sol`, 과거 `shadow.db`, C2의 비활성
+shadow DB가 섞이지 않는다. D2는 각 `config.toml`의 활성 versioned
+`shadow.database_path`, C2는 각 `paper.toml`의 고정
+`data.database_path=.../coinpilot-c2.db`만 읽는다.
+
+설치는 먼저 dry-run으로 중앙 label만 조작하는지 확인한다.
+
+```bash
+./scripts/mac-studio-daily-scorecard install
+./scripts/mac-studio-daily-scorecard install --apply
+./scripts/mac-studio-daily-scorecard doctor
+./scripts/mac-studio-daily-scorecard status
+```
+
+정상 deadline은 매일 `00:10 KST`다. LaunchAgent는 로그인·재부팅 catch-up과 Slack
+실패 backoff를 위해 매시 `:10`에 짧게 실행되지만 deterministic
+`daily-scorecard:v1:<KST date>` key와 별도 delivery receipt 때문에 하루 정상
+메시지는 한 건만 보낸다. Slack POST 성공 직후 local delivered 기록 전에 전원이
+끊기면 원격·로컬 원자 commit이 불가능해 드물게 중복될 수 있는 at-least-once
+경계는 남는다.
+
+새로운 완료일은 먼저 보내고, 그 다음 실행부터 최초 source 일자까지의 미전송
+backlog 또는 retry 가능한 receipt 중 하루만 처리한다. 따라서 여러 날 offline이어도
+날짜를 영구 건너뛰지 않고, 한 번에 메시지를 몰아 보내지도 않는다. 수동 확인은
+기본적으로 preview만 한다. `--apply`도 같은 latest-first/one-day catch-up selector를
+사용하며 이미 delivered인 report ID는 다시 보내지 않는다. 미래 또는 아직 deadline이
+되지 않은 날짜는 freeze·전송하지 않는다.
+
+```bash
+./scripts/mac-studio-daily-scorecard run
+./scripts/mac-studio-daily-scorecard run --apply
+```
+
+성적표 지표 계약은 다음과 같다.
+
+- 공통: KST 전일 고정 반개구간 `[00:00, 24:00)`. 각 sell의 배분원가와 수수료를
+  sell 시각에 인식한 **회계 실현손익**과, position이 flat으로 돌아온 최종 sell
+  시각에 귀속한 **완료 round-trip P&L/승률/보유시간**을 구분한다. 일/전일/최근
+  7일/lineage 체결·수수료·회전대금도 함께 보낸다.
+- D2 observe: current active ledger의 결정·주문·체결·pending 0, flat/equity 불변,
+  run/reconnect/halt/continuity, feed freshness, unresolved audit outbox의 개수·심각도·
+  oldest age, current config와 설치 code fingerprint를 검산한다. 전환 전 diagnostic
+  손익은 receipt/동결 원장에 남기고 일일 활성 PnL에 자동 합산하지 않는다.
+- C2: fill replay로 검산한 실현손익, current cash/position, ACTIVE/revision/
+  updated_at, frozen config fingerprint와 설치 package manifest. 보존된 과거 account는
+  현재 manifest account 집계에서 제외하되 삭제하지 않는다.
+- 안전: 모든 source의 `simulated=true`, `own_execution=false`, `live_order_routing=false`,
+  `orders_sent=0`; legacy health/manifest에 앞의 두 필드가 없으면 검증된 immutable
+  installed simulation-only/public-only runtime identity로만 증명하며, 명시된 값이
+  모순되거나 어느 증거든 불명확하면 PASS로 표시하지 않음
+
+C2는 current state 한 행과 fill event만 저장해 과거 equity history가 없다. 따라서
+boundary가 flat이면 cash가 정확한 equity이고, non-flat이면 최근 완료 60분봉
+close에 수수료·고정 slippage를 적용한 liquidation **추정치**로만 표시한다. C2의
+과거 일중 최대 DD는 `N/A`이며 추정치를 실제 boundary NAV로 부르지 않는다. mark가
+boundary에서 2개 interval보다 오래되면 stale로 보고 equity/return을 `N/A` 처리한다.
+
+8개 source 중 하나라도 일시적으로 읽히지 않거나 fingerprint/reconciliation이
+불명확하면 불완전한 정상 성적표를 freeze하거나 delivered 처리하지 않는다. 대신
+별도 품질 경고를 최대 6시간에 한 번 보내고, 매시 다시 원본에서 계산한다. 정상화된
+뒤에만 해당 날짜의 immutable JSON/Markdown/checksum과 delivery receipt를 만든다.
+JSON이 기록된 직후 중단된 경우에는 그 JSON을 source of truth로 검증해 빠진 Markdown과
+checksum만 복구한다.
+
+자가개선 gate는 데이터 품질, 표본수, 일/7일/lineage 관측을 정리하고 다음
+오프라인 검증을 제안할 뿐이다. 30일 T0 관측 전에는 수익 결론을 내리지 않는다.
+30일 뒤에도 C2 완료 round-trip 30건 미만이면 표본 부족으로 유지한다. 그 뒤에도
+causal replay, purged walk-forward, 2배 비용 stress와 운영자 검토를
+거친 새 model/account/ledger 후보만 만들 수 있다. 활성 전략·설정·halt·원장을
+자동 변경하거나 rearm하지 않는다.
+
+중앙 reporter를 중지하거나 제거해도 결과는 삭제하지 않는다.
+
+```bash
+./scripts/mac-studio-daily-scorecard stop --apply
+./scripts/mac-studio-daily-scorecard uninstall --apply
+```
+
+`uninstall`은 helper, self-manifest, plist만 지우고 report JSON/Markdown, delivery
+receipt와 로그는 보존한다.
 
 설정을 변경했다면 실행 중 프로세스에 임의 반영하지 말고 다음 순서를 사용한다.
 
@@ -156,7 +509,9 @@ launchd 환경변수로 webhook을 전달하지 않는다. dashboard host를
 전략, 모델, 위험 설정을 변경하면 기존 shadow 결과와 같은 검증 구간으로
 이어붙이지 말고 새 run/account로 시작한다. 구체적으로 서비스를 멈춘 뒤
 `shadow.database_path`를 이전 파일과 다른 새 경로로 바꾼다. 기존 DB는
-감사·비교용으로 보존한다.
+감사·비교용으로 보존한다. named instance에서는 새 경로를 해당 instance의
+`data` 디렉터리 바로 아래 `shadow-<version>.db` 형식으로 지정한다. 다른
+디렉터리, symlink, paper DB 재사용은 설치기와 시작 전 검증에서 거부한다.
 
 ## 일상 운영
 
@@ -164,6 +519,7 @@ launchd 환경변수로 webhook을 전달하지 않는다. dashboard host를
 ./scripts/mac-studio status
 ./scripts/mac-studio doctor
 ./scripts/mac-studio logs shadow
+./scripts/mac-studio logs paper
 ./scripts/mac-studio logs notifier --follow
 ./scripts/mac-studio restart shadow --apply
 ```
@@ -178,8 +534,8 @@ launchd 환경변수로 webhook을 전달하지 않는다. dashboard host를
 ```
 
 백업은 SQLite 파일을 단순 복사하지 않는다. Python의 SQLite online backup을
-사용한 뒤 `PRAGMA integrity_check`를 통과한 파일만 원자적으로 확정하고 SHA-256
-파일을 함께 만든다.
+사용한 뒤 `PRAGMA integrity_check`를 통과한 shadow 및 활성 paper 파일만 서로
+다른 이름으로 원자적으로 확정하고 SHA-256 파일을 함께 만든다.
 
 retention은 지정한 전용 디렉터리 안의 일반 파일만 대상으로 한다. 기본값은
 raw 90일, 검증된 backup 35일, 회전 log 30일이다. 활성 로그가 기본 100MB를
@@ -243,6 +599,7 @@ owner-only marker가 있어야 한다. 경로 오설정, symlink, marker 부재 
 - dashboard unavailable: web stderr와 `127.0.0.1:8765` 점유 확인
 - launch domain unavailable: 운영 사용자로 GUI 로그인 후 다시 실행
 - shadow 반복 재시작: stdout/stderr에서 config/model fingerprint 및 DB 오류 확인
+- paper unavailable: paper LaunchAgent, C2 fingerprint, ACTIVE 상태와 최근 갱신 확인
 - 정전 후 미시작: FileVault unlock과 사용자 로그인 상태 확인
 
 재시작 중 놓친 시장 데이터를 과거 호가로 소급 체결하면 안 된다. gap이 발생한

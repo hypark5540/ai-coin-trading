@@ -94,6 +94,7 @@ def cmd_shadow_web(args: Namespace, config: AppConfig) -> int:
         store,
         host=host,
         port=port,
+        market=config.data.market,
         stale_after_seconds=config.operations.stale_after_seconds,
     )
     return 0
@@ -103,6 +104,7 @@ def cmd_shadow_watchdog(args: Namespace, config: AppConfig) -> int:
     store = ShadowStore(config.shadow.database_path)
     result = run_watchdog(
         store,
+        market=config.data.market,
         stale_after_seconds=config.operations.stale_after_seconds,
     )
     _print({"mode": "shadow_watchdog", **result, "orders_sent": 0})

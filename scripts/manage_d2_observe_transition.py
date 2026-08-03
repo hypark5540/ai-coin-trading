@@ -2,9 +2,11 @@
 """Fail-closed D2 bounded-diagnostic to public-feed-observe transition.
 
 The helper validates one stopped, flat D2 ledger and its online backup before
-pointing the instance at a brand-new observe ledger path.  It never copies,
-moves, deletes, or writes the old ledger or its backup.  The default is a
-read-only dry run; configuration changes require ``--apply``.
+pointing the instance at a brand-new observe ledger path.  It never moves,
+deletes, or writes the old ledger, its WAL/SHM companions, or its backup.  A
+private temporary byte-for-byte copy is used when SQLite sidecars remain after
+the clean stop so validation can include committed WAL frames without touching
+the frozen source artifacts.  Configuration changes require ``--apply``.
 
 The mac-studio orchestration wrapper must unload every LaunchAgent for the
 instance before invoking ``--apply``.  This standalone helper proves that the
@@ -207,7 +209,34 @@ def _read_regular_bytes(
 
 
 def _sha256_regular(path: Path, label: str) -> str:
-    return hashlib.sha256(_read_regular_bytes(path, label)).hexdigest()
+    expected = _regular_metadata(path, label)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(path, flags)
+    try:
+        actual = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(actual.st_mode)
+            or actual.st_nlink != 1
+            or (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino)
+        ):
+            raise TransitionError(f"{label} changed before hashing: {path}")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        final = os.fstat(descriptor)
+        if (
+            final.st_size != actual.st_size
+            or final.st_mtime_ns != actual.st_mtime_ns
+            or final.st_ino != actual.st_ino
+        ):
+            raise TransitionError(f"{label} changed while it was hashed: {path}")
+        return digest.hexdigest()
+    finally:
+        os.close(descriptor)
 
 
 def _load_toml(path: Path) -> tuple[bytes, dict[str, Any]]:
@@ -400,11 +429,17 @@ def _exclusive_old_shadow_lock(database: Path) -> Iterator[Path]:
             os.close(descriptor)
 
 
-def _readonly_connection(path: Path, label: str) -> sqlite3.Connection:
+def _readonly_connection(
+    path: Path,
+    label: str,
+    *,
+    immutable: bool = True,
+) -> sqlite3.Connection:
     _regular_metadata(path, label)
+    immutable_query = "&immutable=1" if immutable else ""
     try:
         connection = sqlite3.connect(
-            f"{path.as_uri()}?mode=ro&immutable=1",
+            f"{path.as_uri()}?mode=ro{immutable_query}",
             uri=True,
             timeout=10.0,
             isolation_level=None,
@@ -416,6 +451,123 @@ def _readonly_connection(path: Path, label: str) -> sqlite3.Connection:
         return connection
     except sqlite3.Error as exc:
         raise TransitionError(f"cannot open {label} read-only: {exc}") from exc
+
+
+def _copy_regular(source: Path, destination: Path, label: str) -> None:
+    """Copy a private regular file without following links or changing source."""
+
+    expected = _regular_metadata(source, label)
+    source_flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0)
+    source_flags |= getattr(os, "O_NOFOLLOW", 0)
+    destination_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    destination_flags |= getattr(os, "O_CLOEXEC", 0)
+    destination_flags |= getattr(os, "O_NOFOLLOW", 0)
+    source_descriptor = os.open(source, source_flags)
+    try:
+        actual = os.fstat(source_descriptor)
+        if (
+            not stat.S_ISREG(actual.st_mode)
+            or actual.st_nlink != 1
+            or (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino)
+        ):
+            raise TransitionError(f"{label} changed before frozen copy: {source}")
+        destination_descriptor = os.open(destination, destination_flags, 0o600)
+        try:
+            while True:
+                chunk = os.read(source_descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(destination_descriptor, view)
+                    if written <= 0:
+                        raise OSError("short write while creating frozen SQLite copy")
+                    view = view[written:]
+            os.fsync(destination_descriptor)
+        finally:
+            os.close(destination_descriptor)
+        final = os.fstat(source_descriptor)
+        if (
+            final.st_size != actual.st_size
+            or final.st_mtime_ns != actual.st_mtime_ns
+            or final.st_ino != actual.st_ino
+        ):
+            raise TransitionError(f"{label} changed during frozen copy: {source}")
+    finally:
+        os.close(source_descriptor)
+
+
+@contextmanager
+def _materialized_frozen_sqlite_snapshot(
+    database: Path,
+    *,
+    sidecars: Mapping[str, str],
+    label: str,
+) -> Iterator[Path]:
+    """Yield a standalone snapshot materialized from frozen main+WAL bytes.
+
+    SHM is copied under a noncanonical evidence name because it is a mutable,
+    rebuildable WAL index rather than source-of-truth data.  SQLite therefore
+    rebuilds a private SHM for the copied main+WAL before its backup API emits
+    the standalone snapshot inspected by the transition.
+    """
+
+    with tempfile.TemporaryDirectory(
+        prefix=".coinpilot-d2-transition-",
+        dir=database.parent,
+    ) as temporary:
+        root = Path(temporary)
+        root.chmod(0o700)
+        work = root / "work"
+        evidence = root / "evidence"
+        work.mkdir(mode=0o700)
+        evidence.mkdir(mode=0o700)
+        frozen = work / database.name
+        _copy_regular(database, frozen, label)
+        if "wal" in sidecars:
+            _copy_regular(
+                Path(f"{database}-wal"),
+                Path(f"{frozen}-wal"),
+                f"{label} -wal sidecar",
+            )
+        if "shm" in sidecars:
+            _copy_regular(
+                Path(f"{database}-shm"),
+                evidence / f"{database.name}-shm",
+                f"{label} -shm sidecar",
+            )
+
+        materialized = root / "materialized.sqlite"
+        source: sqlite3.Connection | None = None
+        destination: sqlite3.Connection | None = None
+        try:
+            source = sqlite3.connect(
+                f"{frozen.as_uri()}?mode=ro",
+                uri=True,
+                timeout=10.0,
+                isolation_level=None,
+            )
+            source.execute("PRAGMA query_only = ON")
+            source.execute("PRAGMA busy_timeout = 10000")
+            destination = sqlite3.connect(materialized)
+            source.backup(destination)
+        except sqlite3.Error as exc:
+            raise TransitionError(
+                f"cannot materialize {label} main+WAL snapshot: {exc}"
+            ) from exc
+        finally:
+            if destination is not None:
+                destination.close()
+            if source is not None:
+                source.close()
+        materialized.chmod(0o600)
+        for suffix in ("-wal", "-shm", "-journal"):
+            artifact = Path(f"{materialized}{suffix}")
+            if artifact.exists() or artifact.is_symlink():
+                raise TransitionError(
+                    f"materialized snapshot is not self-contained: {artifact}"
+                )
+        yield materialized
 
 
 def _pragma_ok(connection: sqlite3.Connection, pragma: str, label: str) -> None:
@@ -643,8 +795,9 @@ def _inspect_database(
     market: str,
     label: str,
     enforce_safety: bool,
+    immutable: bool = True,
 ) -> dict[str, Any]:
-    connection = _readonly_connection(path, label)
+    connection = _readonly_connection(path, label, immutable=immutable)
     try:
         _pragma_ok(connection, "quick_check", label)
         _pragma_ok(connection, "integrity_check", label)
@@ -709,6 +862,73 @@ def _sqlite_sidecar_hashes(database: Path, label: str) -> dict[str, str]:
                 candidate, f"{label} {suffix} sidecar"
             )
     return hashes
+
+
+def _sqlite_sidecar_identities(
+    database: Path,
+    label: str,
+) -> dict[str, tuple[int, int, int, int]]:
+    identities: dict[str, tuple[int, int, int, int]] = {}
+    for suffix in ("wal", "shm"):
+        candidate = Path(f"{database}-{suffix}")
+        _reject_symlink_components(candidate, f"{label} -{suffix} sidecar")
+        if candidate.exists() or candidate.is_symlink():
+            metadata = _regular_metadata(candidate, f"{label} -{suffix} sidecar")
+            identities[suffix] = (
+                metadata.st_dev,
+                metadata.st_ino,
+                metadata.st_size,
+                metadata.st_mtime_ns,
+            )
+    return identities
+
+
+def _file_identity(path: Path, label: str) -> tuple[int, int, int, int]:
+    metadata = _regular_metadata(path, label)
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+    )
+
+
+def _assert_file_identity(
+    path: Path,
+    expected: tuple[int, int, int, int],
+    label: str,
+) -> None:
+    if _file_identity(path, label) != expected:
+        raise TransitionError(f"{label} identity changed during validation: {path}")
+
+
+def _assert_sidecar_identities(
+    database: Path,
+    expected: Mapping[str, tuple[int, int, int, int]],
+    label: str,
+) -> None:
+    if _sqlite_sidecar_identities(database, label) != dict(expected):
+        raise TransitionError(f"{label} sidecar identity changed during validation")
+
+
+def _reject_rollback_journal(database: Path, label: str) -> None:
+    journal = Path(f"{database}-journal")
+    _reject_symlink_components(journal, f"{label} rollback journal")
+    if journal.exists() or journal.is_symlink():
+        raise TransitionError(f"{label} has a rollback journal: {journal}")
+
+
+def _sqlite_bundle_sha256(
+    main_sha256: str,
+    sidecar_sha256: Mapping[str, str],
+) -> str:
+    digest = hashlib.sha256()
+    for name, value in (("main", main_sha256), *sorted(sidecar_sha256.items())):
+        digest.update(name.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(value.encode("ascii"))
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _toml_basic_string(value: str) -> str:
@@ -907,7 +1127,10 @@ def _receipt_document(
     version: str,
     source: Path,
     source_sha256: str,
+    source_size_bytes: int,
     source_sidecars: Mapping[str, str],
+    source_sidecar_size_bytes: Mapping[str, int],
+    source_bundle_sha256: str,
     source_logical_sha256: str,
     backup: Path,
     backup_sha256: str,
@@ -925,7 +1148,7 @@ def _receipt_document(
     )
     final_run, final_state = _split_terminal(terminal)
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "transition": "d2-diagnostic-to-public-feed-observe",
         "instance": instance,
         "market": market,
@@ -934,15 +1157,25 @@ def _receipt_document(
         "source": {
             "database_path": str(source),
             "database_sha256": source_sha256,
+            "database_size_bytes": source_size_bytes,
             "database_sha256_scope": (
-                "complete stopped SQLite main file; WAL/SHM absence verified"
+                "stopped SQLite main-file bytes; companion WAL/SHM hashes "
+                "recorded when present"
             ),
             "sqlite_sidecar_sha256": dict(source_sidecars),
+            "sqlite_sidecar_size_bytes": dict(source_sidecar_size_bytes),
+            "sqlite_bundle_sha256": source_bundle_sha256,
             "logical_snapshot_sha256": source_logical_sha256,
             "logical_snapshot_scope": (
-                "complete immutable read-only SQLite main-file snapshot; "
-                "WAL/SHM absence verified"
+                "standalone SQLite backup materialized from a private byte-for-byte "
+                "copy of the stopped main file plus committed WAL frames when "
+                "present; source SHM independently hashed and excluded from "
+                "logical truth while a private SHM is rebuilt"
             ),
+            "logical_snapshot_materialized_from": (
+                "main+committed-WAL-frames-when-present"
+            ),
+            "shm_used_as_logical_truth": False,
             "backup_path": str(backup),
             "backup_sha256": backup_sha256,
             "backup_logical_snapshot_sha256": backup_logical_sha256,
@@ -980,7 +1213,9 @@ def _receipt_document(
             "live_order_routing": False,
             "orders_sent": 0,
             "source_writer_lock_acquired": True,
-            "source_wal_shm_absent": True,
+            "source_sidecars_preserved": True,
+            "source_bundle_byte_preserved": True,
+            "source_snapshot_materialized_from_private_copy": True,
             "backup_wal_shm_absent": True,
             "source_ledger_preserved": True,
             "backup_verified": True,
@@ -1176,13 +1411,19 @@ def execute(
     runtime_after = _render_runtime(runtime_before, runtime)
 
     with _exclusive_old_shadow_lock(source) as old_lock:
+        _reject_rollback_journal(source, "source shadow database")
+        _reject_rollback_journal(backup, "backup database")
+        source_identity = _file_identity(source, "source shadow database")
+        source_sidecar_identities = _sqlite_sidecar_identities(
+            source, "source shadow database"
+        )
+        backup_identity = _file_identity(backup, "backup database")
         source_sidecars = _sqlite_sidecar_hashes(
             source, "source shadow database"
         )
-        if source_sidecars:
+        if set(source_sidecars) != set(source_sidecar_identities):
             raise TransitionError(
-                "stopped source must be checkpointed with no WAL/SHM sidecars; "
-                f"found: {sorted(source_sidecars)}"
+                "source SQLite sidecar presence changed during initial validation"
             )
         backup_sidecars = _sqlite_sidecar_hashes(backup, "backup database")
         if backup_sidecars:
@@ -1192,14 +1433,35 @@ def execute(
             )
         source_sha256 = _sha256_regular(source, "source shadow database")
         backup_sha256 = _sha256_regular(backup, "backup database")
-        sidecar = _validate_backup_sidecar(backup, backup_sha256)
-
-        source_snapshot = _inspect_database(
-            source,
-            market=market,
-            label="source shadow database",
-            enforce_safety=True,
+        _assert_file_identity(
+            source, source_identity, "source shadow database"
         )
+        _assert_sidecar_identities(
+            source,
+            source_sidecar_identities,
+            "source shadow database",
+        )
+        _assert_file_identity(backup, backup_identity, "backup database")
+        sidecar = _validate_backup_sidecar(backup, backup_sha256)
+        source_sidecar_size_bytes = {
+            suffix: identity[2]
+            for suffix, identity in source_sidecar_identities.items()
+        }
+        source_bundle_sha256 = _sqlite_bundle_sha256(
+            source_sha256, source_sidecars
+        )
+
+        with _materialized_frozen_sqlite_snapshot(
+            source,
+            sidecars=source_sidecars,
+            label="source shadow database",
+        ) as materialized_source:
+            source_snapshot = _inspect_database(
+                materialized_source,
+                market=market,
+                label="materialized frozen source shadow database snapshot",
+                enforce_safety=True,
+            )
         backup_snapshot = _inspect_database(
             backup,
             market=market,
@@ -1210,6 +1472,17 @@ def execute(
         # Detect non-cooperating mutation after the SQLite snapshots and before
         # any configuration write.  The service's own writer is excluded by
         # the process lock held across this whole block.
+        _reject_rollback_journal(source, "source shadow database")
+        _reject_rollback_journal(backup, "backup database")
+        _assert_file_identity(
+            source, source_identity, "source shadow database"
+        )
+        _assert_sidecar_identities(
+            source,
+            source_sidecar_identities,
+            "source shadow database",
+        )
+        _assert_file_identity(backup, backup_identity, "backup database")
         if _sha256_regular(source, "source shadow database") != source_sha256:
             raise TransitionError("source shadow database changed during validation")
         if _sha256_regular(backup, "backup database") != backup_sha256:
@@ -1231,7 +1504,10 @@ def execute(
             version=version,
             source=source,
             source_sha256=source_sha256,
+            source_size_bytes=source_identity[2],
             source_sidecars=source_sidecars,
+            source_sidecar_size_bytes=source_sidecar_size_bytes,
+            source_bundle_sha256=source_bundle_sha256,
             source_logical_sha256=source_snapshot["logical_sha256"],
             backup=backup,
             backup_sha256=backup_sha256,

@@ -190,6 +190,52 @@ def _refresh_backup(fixture: Fixture) -> None:
     )
 
 
+def _freeze_committed_wal_sidecars(
+    fixture: Fixture,
+    *,
+    refresh_backup: bool = True,
+) -> dict[Path, bytes]:
+    """Recreate a stopped crash-safe triplet with committed data still in WAL."""
+
+    if refresh_backup:
+        fixture.backup.unlink(missing_ok=True)
+    connection = sqlite3.connect(fixture.source)
+    connection.execute("PRAGMA wal_autocheckpoint = 0")
+    connection.execute("UPDATE shadow_state SET revision = 43")
+    connection.commit()
+    if refresh_backup:
+        backup = sqlite3.connect(fixture.backup)
+        try:
+            connection.backup(backup)
+        finally:
+            backup.close()
+
+    wal = Path(f"{fixture.source}-wal")
+    shm = Path(f"{fixture.source}-shm")
+    assert wal.exists()
+    assert shm.exists()
+    frozen = {
+        fixture.source: fixture.source.read_bytes(),
+        wal: wal.read_bytes(),
+        shm: shm.read_bytes(),
+    }
+    connection.close()
+
+    # Closing the last connection may checkpoint or remove sidecars. Restore
+    # the exact valid pre-close triplet to model the production clean-stop
+    # artifact set without keeping any SQLite handle open during validation.
+    for path, content in frozen.items():
+        _write_private(path, content)
+    if refresh_backup:
+        fixture.backup.chmod(0o600)
+        digest = hashlib.sha256(fixture.backup.read_bytes()).hexdigest()
+        _write_private(
+            fixture.backup.with_name(f"{fixture.backup.name}.sha256"),
+            f"{digest}  {fixture.backup.name}\n",
+        )
+    return frozen
+
+
 def _fixture(tmp_path: Path) -> Fixture:
     home = tmp_path / "d2-btc"
     for path in (
@@ -338,6 +384,7 @@ def test_apply_atomically_updates_only_profile_and_writes_receipt(
     )
 
     receipt = json.loads(receipt_path.read_text())
+    assert receipt["schema_version"] == 2
     assert stat.S_IMODE(receipt_path.stat().st_mode) == 0o600
     assert receipt["source"]["database_sha256"] == hashlib.sha256(
         old_source
@@ -349,7 +396,7 @@ def test_apply_atomically_updates_only_profile_and_writes_receipt(
         receipt["source"]["logical_snapshot_sha256"]
         == receipt["source"]["backup_logical_snapshot_sha256"]
     )
-    assert "WAL/SHM absence verified" in receipt["source"][
+    assert "companion WAL/SHM hashes" in receipt["source"][
         "database_sha256_scope"
     ]
     assert receipt["final"]["run"]["run_id"] == "run-1"
@@ -377,6 +424,73 @@ def test_apply_atomically_updates_only_profile_and_writes_receipt(
         "verified_by_helper": False,
         "enforced_by": "scripts/mac-studio wrapper",
     }
+
+
+def test_committed_source_wal_is_validated_without_mutating_frozen_artifacts(
+    tmp_path: Path,
+) -> None:
+    fixture = _fixture(tmp_path)
+    frozen = _freeze_committed_wal_sidecars(fixture)
+    before_dry_run = _tree_bytes(fixture.home)
+
+    result = _run(fixture)
+
+    assert result["status"] == "dry-run"
+    assert _tree_bytes(fixture.home) == before_dry_run
+    result = _run(fixture, apply=True)
+    assert result["status"] == "applied"
+    for path, content in frozen.items():
+        assert path.read_bytes() == content
+
+    receipt_path = fixture.home / "state" / f"d2-observe-transition-{VERSION}.json"
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["final"]["state"]["revision"] == 43
+    assert receipt["safety"]["source_sidecars_preserved"] is True
+    assert receipt["safety"]["source_bundle_byte_preserved"] is True
+    assert receipt["safety"]["source_snapshot_materialized_from_private_copy"] is True
+    assert receipt["source"]["shm_used_as_logical_truth"] is False
+    assert receipt["source"]["logical_snapshot_materialized_from"] == (
+        "main+committed-WAL-frames-when-present"
+    )
+    assert receipt["source"]["sqlite_sidecar_sha256"] == {
+        "wal": hashlib.sha256(frozen[Path(f"{fixture.source}-wal")]).hexdigest(),
+        "shm": hashlib.sha256(frozen[Path(f"{fixture.source}-shm")]).hexdigest(),
+    }
+    assert receipt["source"]["sqlite_sidecar_size_bytes"] == {
+        "wal": len(frozen[Path(f"{fixture.source}-wal")]),
+        "shm": len(frozen[Path(f"{fixture.source}-shm")]),
+    }
+    assert (
+        receipt["source"]["logical_snapshot_sha256"]
+        == receipt["source"]["backup_logical_snapshot_sha256"]
+    )
+
+
+def test_wal_only_commit_requires_a_matching_terminal_backup(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    _freeze_committed_wal_sidecars(fixture, refresh_backup=False)
+    before = _tree_bytes(fixture.home)
+
+    with pytest.raises(transition.TransitionError, match="terminal run/state"):
+        _run(fixture, apply=True)
+
+    assert _tree_bytes(fixture.home) == before
+
+
+def test_corrupt_frozen_wal_fails_without_persistent_writes(tmp_path: Path) -> None:
+    fixture = _fixture(tmp_path)
+    frozen = _freeze_committed_wal_sidecars(fixture)
+    wal = Path(f"{fixture.source}-wal")
+    corrupted = bytearray(frozen[wal])
+    assert len(corrupted) > 128
+    corrupted[100] ^= 0xFF
+    _write_private(wal, bytes(corrupted))
+    before = _tree_bytes(fixture.home)
+
+    with pytest.raises(transition.TransitionError):
+        _run(fixture, apply=True)
+
+    assert _tree_bytes(fixture.home) == before
 
 
 def test_running_state_and_held_writer_lock_fail_closed(tmp_path: Path) -> None:
